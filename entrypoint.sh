@@ -1,6 +1,21 @@
 #!/bin/sh
 set -e
 
+WG_INTERFACE=${WG_INTERFACE:-"wg0"}
+MICROWARP_DATA_DIR=${MICROWARP_DATA_DIR:-"/var/lib/microwarp"}
+WG_CONF_DIR=${WG_CONF_DIR:-"${MICROWARP_DATA_DIR}"}
+WG_CONF=${WG_CONF:-"${WG_CONF_DIR}/${WG_INTERFACE}.conf"}
+WGCF_PROFILE=${WGCF_PROFILE:-"${MICROWARP_DATA_DIR}/wgcf-profile.conf"}
+WGCF_ACCOUNT=${WGCF_ACCOUNT:-"${MICROWARP_DATA_DIR}/wgcf-account.toml"}
+WG_QUICK_BIN=${WG_QUICK_BIN:-"wg-quick"}
+WARP_READY_ATTEMPTS=${WARP_READY_ATTEMPTS:-6}
+WARP_READY_DELAY_SECONDS=${WARP_READY_DELAY_SECONDS:-2}
+WARP_HEALTHCHECK_CONNECT_TIMEOUT=${WARP_HEALTHCHECK_CONNECT_TIMEOUT:-4}
+WARP_HEALTHCHECK_TOTAL_TIMEOUT=${WARP_HEALTHCHECK_TOTAL_TIMEOUT:-8}
+WARP_HEALTHCHECK_TRACE_URL=${WARP_HEALTHCHECK_TRACE_URL:-"https://1.1.1.1/cdn-cgi/trace"}
+WARP_HEALTHCHECK_TEST_URL=${WARP_HEALTHCHECK_TEST_URL:-"https://www.gstatic.com/generate_204"}
+LEGACY_SYSTEM_WG_CONF=${LEGACY_SYSTEM_WG_CONF:-"/etc/wireguard/${WG_INTERFACE}.conf"}
+
 build_wgcf_download_url() {
     WGCF_VER=$1
     WGCF_ARCH=$2
@@ -14,73 +29,179 @@ build_wgcf_download_url() {
     echo "$RAW_URL"
 }
 
+current_runtime_endpoint() {
+    wg show "$WG_INTERFACE" endpoints 2>/dev/null | awk 'NF >= 2 {print $2; exit}'
+}
+
+peer_public_key() {
+    sed -n 's/^PublicKey = //p' "$WG_CONF" | head -n 1
+}
+
+has_latest_handshake() {
+    wg show "$WG_INTERFACE" latest-handshakes 2>/dev/null | awk 'NF >= 2 && $2 + 0 > 0 {found = 1} END {exit found ? 0 : 1}'
+}
+
+fetch_trace() {
+    curl -4 -sS \
+        --connect-timeout "$WARP_HEALTHCHECK_CONNECT_TIMEOUT" \
+        --max-time "$WARP_HEALTHCHECK_TOTAL_TIMEOUT" \
+        "$WARP_HEALTHCHECK_TRACE_URL" 2>/dev/null || true
+}
+
+trace_warp_active() {
+    printf '%s\n' "$1" | awk -F= '$1 == "warp" && $2 != "off" && $2 != "" {found = 1} END {exit found ? 0 : 1}'
+}
+
+test_warp_http() {
+    curl -4 -fsS -o /dev/null \
+        --connect-timeout "$WARP_HEALTHCHECK_CONNECT_TIMEOUT" \
+        --max-time "$WARP_HEALTHCHECK_TOTAL_TIMEOUT" \
+        "$WARP_HEALTHCHECK_TEST_URL" >/dev/null 2>&1
+}
+
+wait_for_warp_ready() {
+    attempt=1
+    while [ "$attempt" -le "$WARP_READY_ATTEMPTS" ]; do
+        TRACE_OUTPUT=$(fetch_trace)
+        if has_latest_handshake && trace_warp_active "$TRACE_OUTPUT" && test_warp_http; then
+            printf '%s\n' "$TRACE_OUTPUT"
+            return 0
+        fi
+        sleep "$WARP_READY_DELAY_SECONDS"
+        attempt=$((attempt + 1))
+    done
+    return 1
+}
+
+set_runtime_endpoint() {
+    NEW_ENDPOINT=$1
+    PEER_KEY=$2
+    [ -n "$NEW_ENDPOINT" ] || return 1
+    [ -n "$PEER_KEY" ] || return 1
+    wg set "$WG_INTERFACE" peer "$PEER_KEY" endpoint "$NEW_ENDPOINT" > /dev/null 2>&1 || return 1
+    sed -i "s|^Endpoint = .*|Endpoint = ${NEW_ENDPOINT}|" "$WG_CONF"
+}
+
+build_candidate_endpoints() {
+    CURRENT_ENDPOINT=$1
+    (
+        [ -n "$CURRENT_ENDPOINT" ] && printf '%s\n' "$CURRENT_ENDPOINT"
+        [ -n "${ENDPOINT_IP:-}" ] && printf '%s\n' "$ENDPOINT_IP"
+        printf '%s\n' "${ENDPOINT_CANDIDATES:-}" | tr ',' '\n'
+    ) | awk 'NF && !seen[$0]++'
+}
+
+sync_wg_conf_from_profile() {
+    [ -f "$WGCF_PROFILE" ] || return 1
+    cp "$WGCF_PROFILE" "$WG_CONF"
+    chmod 600 "$WG_CONF"
+}
+
+migrate_legacy_wg_conf() {
+    if [ -f "$WG_CONF" ]; then
+        return 0
+    fi
+
+    if [ "$WG_CONF" != "$LEGACY_SYSTEM_WG_CONF" ] && [ -f "$LEGACY_SYSTEM_WG_CONF" ]; then
+        echo "==> [MicroWARP] 检测到旧版 /etc/wireguard 配置，正在迁移到 ${WG_CONF}"
+        cp "$LEGACY_SYSTEM_WG_CONF" "$WG_CONF"
+        chmod 600 "$WG_CONF"
+    fi
+}
+
 if [ "${MICROWARP_TEST_MODE:-0}" = "1" ]; then
     return 0 2>/dev/null || exit 0
 fi
 
-WG_CONF="/etc/wireguard/wg0.conf"
-mkdir -p /etc/wireguard
+mkdir -p "$(dirname "$WG_CONF")"
+mkdir -p "$MICROWARP_DATA_DIR"
+migrate_legacy_wg_conf
 
 # ==========================================
 # 1. 账号全自动申请与配置生成 (阅后即焚)
 # ==========================================
 if [ ! -f "$WG_CONF" ]; then
-    echo "==> [MicroWARP] 未检测到配置，正在全自动初始化 Cloudflare WARP..."
+    if [ -f "$WGCF_PROFILE" ]; then
+        echo "==> [MicroWARP] 检测到已有持久化 profile，正在生成运行配置。"
+        sync_wg_conf_from_profile
+    else
+        echo "==> [MicroWARP] 未检测到配置，正在全自动初始化 Cloudflare WARP..."
 
-    ARCH=$(uname -m)
-    case "$ARCH" in
-        x86_64) WGCF_ARCH="amd64" ;;
-        aarch64) WGCF_ARCH="arm64" ;;
-        *) echo "==> [ERROR] 不支持的架构: $ARCH"; exit 1 ;;
-    esac
+        ARCH=$(uname -m)
+        case "$ARCH" in
+            x86_64) WGCF_ARCH="amd64" ;;
+            aarch64) WGCF_ARCH="arm64" ;;
+            *) echo "==> [ERROR] 不支持的架构: $ARCH"; exit 1 ;;
+        esac
 
-    WGCF_VER=$(curl -sL https://api.github.com/repos/ViRb3/wgcf/releases/latest | grep '"tag_name"' | sed 's/.*"v\(.*\)".*/\1/')
-    echo "==> [MicroWARP] 检测到最新 wgcf 版本: v${WGCF_VER}"
-    wget --timeout=15 -qO wgcf "$(build_wgcf_download_url "$WGCF_VER" "$WGCF_ARCH")"
-    chmod +x wgcf
+        WGCF_VER_DEFAULT="2.2.31"
+        WGCF_VER=$(
+            curl -fsSL --connect-timeout 5 --max-time 10 \
+                https://api.github.com/repos/ViRb3/wgcf/releases/latest 2>/dev/null \
+            | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\([^"]*\)".*/\1/p' \
+            | head -n 1
+        )
 
-    echo "==> [MicroWARP] 正在向 CF 注册设备..."
-    ./wgcf register --accept-tos > /dev/null
+        if [ -n "$WGCF_VER" ]; then
+            echo "==> [MicroWARP] 检测到最新 wgcf 版本: v${WGCF_VER}"
+        else
+            WGCF_VER="$WGCF_VER_DEFAULT"
+            echo "==> [MicroWARP] 获取最新 wgcf 版本失败，回退到默认版本: v${WGCF_VER}"
+        fi
 
-    echo "==> [MicroWARP] 正在生成 WireGuard 配置文件..."
-    ./wgcf generate > /dev/null
+        TMP_WGCF_DIR=$(mktemp -d)
+        cleanup_tmp_wgcf_dir() {
+            rm -rf "$TMP_WGCF_DIR"
+        }
+        trap 'cleanup_tmp_wgcf_dir' EXIT HUP INT TERM
 
-    mv wgcf-profile.conf "$WG_CONF"
+        wget --timeout=15 -qO "${TMP_WGCF_DIR}/wgcf" "$(build_wgcf_download_url "$WGCF_VER" "$WGCF_ARCH")"
+        chmod +x "${TMP_WGCF_DIR}/wgcf"
 
-    # 【核心安全】阅后即焚：删除注册工具和生成的账号明文文件
-    rm -f wgcf wgcf-account.toml
-    echo "==> [MicroWARP] 节点配置生成成功！"
+        echo "==> [MicroWARP] 正在向 CF 注册设备..."
+        (
+            cd "$TMP_WGCF_DIR"
+            ./wgcf register --accept-tos > /dev/null
+        )
+
+        echo "==> [MicroWARP] 正在生成 WireGuard 配置文件..."
+        (
+            cd "$TMP_WGCF_DIR"
+            ./wgcf generate > /dev/null
+        )
+
+        mv "${TMP_WGCF_DIR}/wgcf-profile.conf" "$WGCF_PROFILE"
+        mv "${TMP_WGCF_DIR}/wgcf-account.toml" "$WGCF_ACCOUNT"
+        chmod 600 "$WGCF_PROFILE" "$WGCF_ACCOUNT"
+        sync_wg_conf_from_profile
+
+        trap - EXIT HUP INT TERM
+        cleanup_tmp_wgcf_dir
+        echo "==> [MicroWARP] 节点配置生成成功！"
+    fi
 else
     echo "==> [MicroWARP] 检测到已有持久化配置，跳过注册。"
 fi
 
 # ==========================================
-# 2. 强力洗白与内核兼容性处理 (防正则误杀版)
+# 2. 强力洗白与内核兼容性处理 (性能优化版)
 # ==========================================
 
-# 1. 智能提取出纯 IPv4 地址 (防止 wgcf v2.2.30 将双栈 IP 写在同一行导致误杀)
+# 1. 智能提取出纯 IPv4 地址
 IPV4_ADDR=$(grep '^Address' "$WG_CONF" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}' | head -n 1)
 
-# 2. 物理删除所有原始的 Address, AllowedIPs, DNS，防止 RTNETLINK 崩溃或 DNS 死锁
-sed -i '/^Address/d' "$WG_CONF"
-sed -i '/^AllowedIPs/d' "$WG_CONF"
-sed -i '/^DNS.*/d' "$WG_CONF"
-
-# 3. 重建最纯净的 IPv4 路由规则
-if [ -n "$IPV4_ADDR" ]; then
-    sed -i "/\[Interface\]/a Address = $IPV4_ADDR" "$WG_CONF"
-fi
-sed -i "/\[Peer\]/a AllowedIPs = 0.0.0.0\/0" "$WG_CONF"
-
-# 删除 Alpine 系统自带 wg-quick 中不兼容的路由标记
-sed -i '/src_valid_mark/d' /usr/bin/wg-quick
-
-# 【新增：抗断流绝杀】强制注入 15 秒 UDP 心跳保活，对抗运营商 QoS 丢包
-if ! grep -q "PersistentKeepalive" "$WG_CONF"; then
-    sed -i '/\[Peer\]/a PersistentKeepalive = 15' "$WG_CONF"
-else
-    sed -i 's/PersistentKeepalive.*/PersistentKeepalive = 15/g' "$WG_CONF"
-fi
+# 2. 合并配置文件修改逻辑，减少磁盘 I/O
+echo "==> [MicroWARP] 正在优化 WireGuard 网络配置 (MTU=1280, Keepalive=15)..."
+sed -i -e '/^Address/d' \
+       -e '/^AllowedIPs/d' \
+       -e '/^DNS.*/d' \
+       -e '/^MTU/d' \
+       -e '/^PersistentKeepalive/d' \
+       -e "/\[Interface\]/a Address = ${IPV4_ADDR:-172.16.0.2/32}" \
+       -e '/\[Interface\]/a MTU = 1280' \
+       -e '/\[Peer\]/a AllowedIPs = 0.0.0.0/0' \
+       -e '/\[Peer\]/a PersistentKeepalive = 15' \
+       "$WG_CONF"
 
 # 【新增：防阻断绝杀】针对 HK/US 强校验机房，注入自定义优选 Endpoint IP
 if [ -n "$ENDPOINT_IP" ]; then
@@ -95,21 +216,76 @@ fi
 PRE_WARP_ROUTE=$(ip route get 100.64.0.1 2>/dev/null | head -n 1 || true)
 PRE_WARP_GW=$(printf '%s\n' "$PRE_WARP_ROUTE" | awk '{for (i = 1; i <= NF; i++) if ($i == "via") print $(i + 1)}')
 PRE_WARP_DEV=$(printf '%s\n' "$PRE_WARP_ROUTE" | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}')
+PRE_WARP_SRC=$(printf '%s\n' "$PRE_WARP_ROUTE" | awk '{for (i = 1; i <= NF; i++) if ($i == "src") print $(i + 1)}')
 
-echo "==> [MicroWARP] 正在启动 Linux 内核级 wg0 网卡..."
-wg-quick up wg0 > /dev/null 2>&1
+echo "==> [MicroWARP] 正在启动 Linux 内核级 ${WG_INTERFACE} 网卡..."
+"$WG_QUICK_BIN" up "$WG_CONF" > /dev/null 2>&1
 
 # 仅在 WARP 启动前确实存在原始回程路径时恢复 100.64.0.0/10，减少对非 Tailscale 场景的影响
 TAILSCALE_CIDR=${TAILSCALE_CIDR:-"100.64.0.0/10"}
-if [ -n "$PRE_WARP_GW" ] && [ -n "$PRE_WARP_DEV" ]; then
-    if ip route replace "$TAILSCALE_CIDR" via "$PRE_WARP_GW" dev "$PRE_WARP_DEV" > /dev/null 2>&1; then
-        echo "==> [MicroWARP] 已为 ${TAILSCALE_CIDR} 恢复 WARP 启动前的回程路由: via ${PRE_WARP_GW} dev ${PRE_WARP_DEV}"
+if [ -n "$PRE_WARP_DEV" ]; then
+    ROUTE_RESTORED=0
+    if [ -n "$PRE_WARP_GW" ]; then
+        if [ -n "$PRE_WARP_SRC" ]; then
+            RESTORE_ROUTE_DESC="via ${PRE_WARP_GW} dev ${PRE_WARP_DEV} src ${PRE_WARP_SRC}"
+            if ip route replace "$TAILSCALE_CIDR" via "$PRE_WARP_GW" dev "$PRE_WARP_DEV" src "$PRE_WARP_SRC" > /dev/null 2>&1; then
+                ROUTE_RESTORED=1
+            fi
+        else
+            RESTORE_ROUTE_DESC="via ${PRE_WARP_GW} dev ${PRE_WARP_DEV}"
+            if ip route replace "$TAILSCALE_CIDR" via "$PRE_WARP_GW" dev "$PRE_WARP_DEV" > /dev/null 2>&1; then
+                ROUTE_RESTORED=1
+            fi
+        fi
+    else
+        if [ -n "$PRE_WARP_SRC" ]; then
+            RESTORE_ROUTE_DESC="dev ${PRE_WARP_DEV} src ${PRE_WARP_SRC}"
+            if ip route replace "$TAILSCALE_CIDR" dev "$PRE_WARP_DEV" src "$PRE_WARP_SRC" > /dev/null 2>&1; then
+                ROUTE_RESTORED=1
+            fi
+        else
+            RESTORE_ROUTE_DESC="dev ${PRE_WARP_DEV}"
+            if ip route replace "$TAILSCALE_CIDR" dev "$PRE_WARP_DEV" > /dev/null 2>&1; then
+                ROUTE_RESTORED=1
+            fi
+        fi
+    fi
+
+    if [ "$ROUTE_RESTORED" = "1" ]; then
+        echo "==> [MicroWARP] 已为 ${TAILSCALE_CIDR} 恢复 WARP 启动前的回程路由: ${RESTORE_ROUTE_DESC}"
     fi
 fi
 
+PEER_KEY=$(peer_public_key)
+CURRENT_ENDPOINT=$(current_runtime_endpoint)
+TRACE_OUTPUT=""
+WARP_READY=0
+
+for CANDIDATE_ENDPOINT in $(build_candidate_endpoints "$CURRENT_ENDPOINT"); do
+    ACTIVE_ENDPOINT=$(current_runtime_endpoint)
+    if [ -n "$CANDIDATE_ENDPOINT" ] && [ "$CANDIDATE_ENDPOINT" != "$ACTIVE_ENDPOINT" ]; then
+        echo "==> [MicroWARP] 正在切换 Endpoint 进行连通性尝试: $CANDIDATE_ENDPOINT"
+        if ! set_runtime_endpoint "$CANDIDATE_ENDPOINT" "$PEER_KEY"; then
+            echo "==> [MicroWARP] ⚠️ Endpoint 切换失败，跳过: $CANDIDATE_ENDPOINT"
+            continue
+        fi
+    fi
+
+    echo "==> [MicroWARP] 正在检查 WARP 隧道可用性..."
+    if TRACE_OUTPUT=$(wait_for_warp_ready); then
+        WARP_READY=1
+        break
+    fi
+done
+
+if [ "$WARP_READY" != "1" ]; then
+    echo "==> [ERROR] WARP 隧道未就绪，未检测到有效握手或可用出口。"
+    "$WG_QUICK_BIN" down "$WG_INTERFACE" > /dev/null 2>&1 || true
+    exit 1
+fi
+
 echo "==> [MicroWARP] 当前出口 IP 已成功变更为："
-# 获取最新的 CF 溯源 IP (加入 5 秒强制超时，完美替代有缺陷的 & 后台执行)
-curl -s -m 5 https://1.1.1.1/cdn-cgi/trace | grep ip= || echo "⚠️ 获取超时 (可能是底层握手延迟或节点被强阻断)"
+printf '%s\n' "$TRACE_OUTPUT" | grep '^ip=' || echo "⚠️ 未从 trace 输出中解析到 ip 字段"
 
 # ==========================================
 # 4. 启动 C 语言 SOCKS5 代理服务 (带高级参数绑定)
@@ -118,13 +294,24 @@ curl -s -m 5 https://1.1.1.1/cdn-cgi/trace | grep ip= || echo "⚠️ 获取超�
 LISTEN_ADDR=${BIND_ADDR:-"0.0.0.0"}
 LISTEN_PORT=${BIND_PORT:-"1080"}
 
+if { [ -n "$SOCKS_USER" ] && [ -z "$SOCKS_PASS" ]; } || { [ -z "$SOCKS_USER" ] && [ -n "$SOCKS_PASS" ]; }; then
+    echo "==> [ERROR] SOCKS_USER 和 SOCKS_PASS 必须同时设置，或同时留空。"
+    exit 1
+fi
+
 if [ -n "$SOCKS_USER" ] && [ -n "$SOCKS_PASS" ]; then
     echo "==> [MicroWARP] 🔒 身份认证已开启 (User: $SOCKS_USER)"
+    if [ -n "${PROXY_CONNECT_HOST:-}" ]; then
+        echo "==> [MicroWARP] 宿主机可通过 ${PROXY_CONNECT_HOST}:${LISTEN_PORT} 使用该 SOCKS5 代理"
+    fi
     echo "==> [MicroWARP] 🚀 MicroSOCKS 引擎已启动，正在监听 ${LISTEN_ADDR}:${LISTEN_PORT}"
     # 使用 exec 接管进程，实现 Zero-Overhead 的底层进程控制
     exec microsocks -i "$LISTEN_ADDR" -p "$LISTEN_PORT" -u "$SOCKS_USER" -P "$SOCKS_PASS"
 else
     echo "==> [MicroWARP] ⚠️ 未设置密码，当前为公开访问模式"
+    if [ -n "${PROXY_CONNECT_HOST:-}" ]; then
+        echo "==> [MicroWARP] 宿主机可通过 ${PROXY_CONNECT_HOST}:${LISTEN_PORT} 使用该 SOCKS5 代理"
+    fi
     echo "==>[MicroWARP] 🚀 MicroSOCKS 引擎已启动，正在监听 ${LISTEN_ADDR}:${LISTEN_PORT}"
     exec microsocks -i "$LISTEN_ADDR" -p "$LISTEN_PORT"
 fi

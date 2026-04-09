@@ -82,6 +82,32 @@ Run the container:
 docker compose up -d
 ```
 
+### 🖥 Bare-Metal Deploy
+
+If you prefer running MicroWARP directly on a Linux host without Docker, the repository now includes an installer:
+
+```bash
+chmod +x install.sh
+sudo ./install.sh
+```
+
+This installer will:
+1. Install system dependencies (`wireguard-tools`, `iproute`, `iptables`, compiler toolchain, etc.)
+2. Build and install `microsocks`
+3. Copy the runtime files to `/opt/microwarp`
+4. Reuse or create persistent WARP state under `/var/lib/microwarp`
+5. Generate `/etc/microwarp/microwarp.env`
+6. Generate a `systemd` service named `microwarp.service`
+
+Bare-metal now defaults to `netns-proxy` mode:
+1. WARP only takes over a dedicated Linux network namespace instead of the host default route
+2. Your host projects connect to `${NETNS_PEER_HOST}:${BIND_PORT}` as a local-only SOCKS5 endpoint
+3. For programs that cannot speak SOCKS directly, use `microwarp-exec <command...>` to run them inside the same namespace
+
+If you explicitly want the old host-wide behavior, set `MICROWARP_MODE=host-global` in `/etc/microwarp/microwarp.env`.
+
+For programmatic integration details, default SOCKS5 endpoint, and `microwarp-exec` usage, see [USAGE.md](./USAGE.md).
+
 ### ⚙️ Advanced Configurations
 
 MicroWARP supports environment variables to customize your setup while keeping the memory footprint at 800KB:
@@ -97,7 +123,18 @@ MicroWARP supports environment variables to customize your setup while keeping t
       # If your VPS is in a datacenter (e.g., DMIT, AWS) where UDP 2408 is throttled or blocked,
       # use port 4500 (standard IPsec NAT-T) to bypass restrictive firewall rules.
       - ENDPOINT_IP=162.159.192.1:4500 
+      - ENDPOINT_CANDIDATES=162.159.192.1:2408,162.159.192.1:4500,188.114.96.7:2408
+
+      # Health-check tuning for slow or unstable networks:
+      - WARP_READY_ATTEMPTS=6
+      - WARP_READY_DELAY_SECONDS=2
+      - WARP_HEALTHCHECK_CONNECT_TIMEOUT=4
+      - WARP_HEALTHCHECK_TOTAL_TIMEOUT=8
+      - WARP_HEALTHCHECK_TRACE_URL=https://1.1.1.1/cdn-cgi/trace
+      - WARP_HEALTHCHECK_TEST_URL=https://www.gstatic.com/generate_204
 ```
+
+These connectivity tuning variables can also be placed in `/etc/microwarp/microwarp.env` for bare-metal `netns-proxy` deployments; they are forwarded into the namespace where WARP actually runs.
 
 ---
 
@@ -154,6 +191,32 @@ volumes:
 docker compose up -d
 ```
 
+### 🖥 裸机部署
+
+如果你不想依赖 Docker，现在仓库已经自带裸机安装脚本：
+
+```bash
+chmod +x install.sh
+sudo ./install.sh
+```
+
+安装脚本会自动完成这些事：
+1. 安装 `wireguard-tools`、`iproute`、`iptables`、编译工具链等系统依赖
+2. 编译并安装 `microsocks`
+3. 将运行文件安装到 `/opt/microwarp`
+4. 复用或创建 `/var/lib/microwarp` 下的 WARP 持久化状态
+5. 生成环境文件 `/etc/microwarp/microwarp.env`
+6. 生成 `systemd` 服务 `microwarp.service`
+
+裸机模式现在默认使用 `netns-proxy`：
+1. WARP 只接管独立的 Linux network namespace，不再默认改宿主机主路由
+2. 宿主机上的项目直接连接 `${NETNS_PEER_HOST}:${BIND_PORT}` 作为本地 SOCKS5 入口
+3. 对于不支持 SOCKS 的程序，可以使用 `microwarp-exec <command...>` 把它直接放进同一个 namespace 里运行
+
+如果你明确需要旧的宿主机全局模式，再把 `/etc/microwarp/microwarp.env` 里的 `MICROWARP_MODE` 改成 `host-global`。
+
+如果你需要给其他程序接入默认 SOCKS5 地址、了解 `microwarp-exec` 的调用方式，见 [USAGE.md](./USAGE.md)。
+
 ### ⚙️ 进阶配置：认证与网络连通性优化
 
 MicroWARP 支持通过环境变量进行参数定制：
@@ -170,7 +233,18 @@ MicroWARP 支持通过环境变量进行参数定制：
       # 针对部分对 UDP 2408 端口存在 QoS 限制的机房（如 DMIT、搬瓦工等）。
       # 可将端口修改为 4500 (标准 IPsec NAT-T 端口) 规避审查特征，提升连通率。
       - ENDPOINT_IP=162.159.192.1:4500
+      - ENDPOINT_CANDIDATES=162.159.192.1:2408,162.159.192.1:4500,188.114.96.7:2408
+
+      # WARP 就绪检查与重试参数
+      - WARP_READY_ATTEMPTS=6
+      - WARP_READY_DELAY_SECONDS=2
+      - WARP_HEALTHCHECK_CONNECT_TIMEOUT=4
+      - WARP_HEALTHCHECK_TOTAL_TIMEOUT=8
+      - WARP_HEALTHCHECK_TRACE_URL=https://1.1.1.1/cdn-cgi/trace
+      - WARP_HEALTHCHECK_TEST_URL=https://www.gstatic.com/generate_204
 ```
+
+以上这些连通性调优参数，在裸机 `netns-proxy` 模式下同样可以直接写入 `/etc/microwarp/microwarp.env`，会被透传到独立 namespace 内实际运行的 WARP 进程。
 
 ### 🚀 扩展用法：转换为 HTTP 代理
 
