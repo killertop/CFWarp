@@ -1,39 +1,6 @@
 #!/bin/sh
 set -eu
 
-if [ $# -eq 0 ]; then
-    echo "用法: microwarp-exec <command> [args...]" >&2
-    exit 1
-fi
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 
-MICROWARP_ENV_FILE=${MICROWARP_ENV_FILE:-"__MICROWARP_ENV_FILE__"}
-MICROWARP_MODE_OVERRIDE=${MICROWARP_MODE-}
-NETNS_NAME_OVERRIDE=${NETNS_NAME-}
-if [ -f "$MICROWARP_ENV_FILE" ]; then
-    set -a
-    # shellcheck disable=SC1090
-    . "$MICROWARP_ENV_FILE"
-    set +a
-fi
-
-if [ -n "${MICROWARP_MODE_OVERRIDE}" ]; then
-    MICROWARP_MODE=$MICROWARP_MODE_OVERRIDE
-fi
-if [ -n "${NETNS_NAME_OVERRIDE}" ]; then
-    NETNS_NAME=$NETNS_NAME_OVERRIDE
-fi
-
-MICROWARP_MODE=${MICROWARP_MODE:-"netns-proxy"}
-NETNS_NAME=${NETNS_NAME:-"microwarp"}
-
-if [ "$MICROWARP_MODE" = "host-global" ]; then
-    echo "当前 MICROWARP_MODE=host-global，没有可加入的独立 namespace。" >&2
-    exit 1
-fi
-
-if ! ip netns list 2>/dev/null | awk '{print $1}' | grep -Fx "$NETNS_NAME" > /dev/null 2>&1; then
-    echo "找不到 network namespace \"$NETNS_NAME\"。请先启动 microwarp.service。" >&2
-    exit 1
-fi
-
-exec ip netns exec "$NETNS_NAME" "$@"
+exec sh "$SCRIPT_DIR/cfwarp-exec" "$@"
