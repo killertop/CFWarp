@@ -432,7 +432,10 @@ if [ "$WARP_READY" != "1" ]; then
     exit 1
 fi
 
-CFWARP_EXIT_IP=$(printf '%s\n' "$TRACE_OUTPUT" | sed -n 's/^ip=//p' | head -n 1)
+CFWARP_EXIT_IP=$(awk -F= '$1 == "ip" {print $2; exit}' <<EOF
+$TRACE_OUTPUT
+EOF
+)
 echo "==> [CFwarp] WARP 出口已就绪: ${CFWARP_EXIT_IP:-unknown}"
 
 if [ "$CFWARP_PROBE_MODE" = "1" ]; then

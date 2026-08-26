@@ -201,9 +201,11 @@ check_once() {
         return 1
     fi
 
-    EXIT_IP=$(printf '%s\n' "$TRACE_OUTPUT" | sed -n 's/^ip=//p' | head -n 1)
-    COLO=$(printf '%s\n' "$TRACE_OUTPUT" | sed -n 's/^colo=//p' | head -n 1)
-    WARP_STATE=$(printf '%s\n' "$TRACE_OUTPUT" | sed -n 's/^warp=//p' | head -n 1)
+    eval "$(printf '%s\n' "$TRACE_OUTPUT" | awk -F= '
+        $1 == "ip" && !ip_seen { printf "EXIT_IP='\''%s'\'';\n", $2; ip_seen=1 }
+        $1 == "colo" && !colo_seen { printf "COLO='\''%s'\'';\n", $2; colo_seen=1 }
+        $1 == "warp" && !warp_seen { printf "WARP_STATE='\''%s'\'';\n", $2; warp_seen=1 }
+    ')"
     TOTAL_MS=$(awk -v total="${TIME_TOTAL:-0}" 'BEGIN { printf "%d", total * 1000 }')
     WARN_SLOW=0
     if awk -v total="${TIME_TOTAL:-0}" -v warn="$CFWARP_HEALTH_WARN_TOTAL_SECONDS" 'BEGIN { exit total > warn ? 0 : 1 }'; then

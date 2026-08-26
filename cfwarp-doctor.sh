@@ -201,8 +201,10 @@ check_runtime() {
         fi
     fi
     if "$SCRIPT_DIR/cfwarp-healthcheck.sh" --format env > "$TMP_HEALTH" 2>&1; then
-        HEALTH_IP=$(sed -n 's/^CFWARP_EXIT_IP=//p' "$TMP_HEALTH" | head -n 1)
-        HEALTH_COLO=$(sed -n 's/^CFWARP_COLO=//p' "$TMP_HEALTH" | head -n 1)
+        eval "$(awk -F= '
+            $1 == "CFWARP_EXIT_IP" && !ip_seen { printf "HEALTH_IP='\''%s'\'';\n", $2; ip_seen=1 }
+            $1 == "CFWARP_COLO" && !colo_seen { printf "HEALTH_COLO='\''%s'\'';\n", $2; colo_seen=1 }
+        ' "$TMP_HEALTH")"
         ok "SOCKS/WARP 健康检查通过: exit_ip=${HEALTH_IP:-unknown} colo=${HEALTH_COLO:-unknown}"
     else
         cat "$TMP_HEALTH" >&2

@@ -106,17 +106,7 @@ if [ ! -f "$WGCF_PROFILE" ] && [ ! -f "$WG_CONF" ]; then
 fi
 
 TMP_ROOT=$(mktemp -d)
-PROBE_TOKEN=$$
-PROBE_NETNS="cfpr${PROBE_TOKEN}"
-PROBE_HOST_IF="cfprh${PROBE_TOKEN}"
-PROBE_NS_IF="cfprn${PROBE_TOKEN}"
-PROBE_STATE_DIR="${CFWARP_ENDPOINT_REFRESH_STATE_ROOT}/${PROBE_TOKEN}"
-PROBE_HOST_ADDR=${CFWARP_ENDPOINT_PROBE_HOST_ADDR:-169.254.241.1/30}
-PROBE_PEER_ADDR=${CFWARP_ENDPOINT_PROBE_PEER_ADDR:-169.254.241.2/30}
-PROBE_CIDR=${CFWARP_ENDPOINT_PROBE_CIDR:-169.254.241.0/30}
-PROBE_NAT_CHAIN="CFPRN${PROBE_TOKEN}"
-PROBE_FWD_CHAIN="CFPRF${PROBE_TOKEN}"
-PROBE_WG_INTERFACE="wgp${PROBE_TOKEN}"
+PROBE_TOKEN=$(($$ % 10000))
 LOCK_DIR="${CFWARP_ENDPOINT_REFRESH_STATE_ROOT}/lock"
 LOCK_PID_FILE="${LOCK_DIR}/pid"
 LOCK_HELD=0
@@ -125,18 +115,23 @@ SERVICE_RESTORED=0
 
 cleanup() {
     CFWARP_EXIT_STATUS=$?
-    CFWARP_MODE=netns-proxy \
-    NETNS_NAME="$PROBE_NETNS" \
-    NETNS_HOST_IF="$PROBE_HOST_IF" \
-    NETNS_NS_IF="$PROBE_NS_IF" \
-    CFWARP_STATE_DIR="$PROBE_STATE_DIR" \
-    NETNS_HOST_ADDR="$PROBE_HOST_ADDR" \
-    NETNS_PEER_ADDR="$PROBE_PEER_ADDR" \
-    NETNS_CIDR="$PROBE_CIDR" \
-    NAT_CHAIN="$PROBE_NAT_CHAIN" \
-    FWD_CHAIN="$PROBE_FWD_CHAIN" \
-    WG_QUICK_BIN="$WG_QUICK_BIN" \
-    sh "$SCRIPT_DIR/cfwarp-netns.sh" down >/dev/null 2>&1 || true
+    for CANDIDATE_DIR in "${TMP_ROOT}/candidate-"*; do
+        [ -d "$CANDIDATE_DIR" ] || continue
+        INDEX=${CANDIDATE_DIR##*-}
+        SUBNET_BASE=$((INDEX * 4))
+        CFWARP_MODE=netns-proxy \
+        NETNS_NAME="cfpr${PROBE_TOKEN}_${INDEX}" \
+        NETNS_HOST_IF="cfh${PROBE_TOKEN}_${INDEX}" \
+        NETNS_NS_IF="cfn${PROBE_TOKEN}_${INDEX}" \
+        CFWARP_STATE_DIR="${CFWARP_ENDPOINT_REFRESH_STATE_ROOT}/${PROBE_TOKEN}_${INDEX}" \
+        NETNS_HOST_ADDR="169.254.241.$((SUBNET_BASE + 1))/30" \
+        NETNS_PEER_ADDR="169.254.241.$((SUBNET_BASE + 2))/30" \
+        NETNS_CIDR="169.254.241.${SUBNET_BASE}/30" \
+        NAT_CHAIN="CFN${PROBE_TOKEN}_${INDEX}" \
+        FWD_CHAIN="CFF${PROBE_TOKEN}_${INDEX}" \
+        WG_QUICK_BIN="$WG_QUICK_BIN" \
+        sh "$SCRIPT_DIR/cfwarp-netns.sh" down >/dev/null 2>&1 || true
+    done
     if [ "$SERVICE_WAS_ACTIVE" = "1" ] && [ "$SERVICE_RESTORED" != "1" ] && systemd_available; then
         systemctl start "$CFWARP_SERVICE_NAME" >/dev/null 2>&1 || true
     fi
@@ -187,18 +182,81 @@ if [ ! -s "$CANDIDATE_FILE" ]; then
     exit 0
 fi
 
-CFWARP_MODE=netns-proxy \
-NETNS_NAME="$PROBE_NETNS" \
-NETNS_HOST_IF="$PROBE_HOST_IF" \
-NETNS_NS_IF="$PROBE_NS_IF" \
-CFWARP_STATE_DIR="$PROBE_STATE_DIR" \
-NETNS_HOST_ADDR="$PROBE_HOST_ADDR" \
-NETNS_PEER_ADDR="$PROBE_PEER_ADDR" \
-NETNS_CIDR="$PROBE_CIDR" \
-NAT_CHAIN="$PROBE_NAT_CHAIN" \
-FWD_CHAIN="$PROBE_FWD_CHAIN" \
-WG_QUICK_BIN="$WG_QUICK_BIN" \
-sh "$SCRIPT_DIR/cfwarp-netns.sh" up
+run_probe_for_candidate() {
+    LOCAL_INDEX=$1
+    LOCAL_ENDPOINT=$2
+    LOCAL_DIR=$3
+    
+    LOCAL_NETNS="cfpr${PROBE_TOKEN}_${LOCAL_INDEX}"
+    LOCAL_HOST_IF="cfh${PROBE_TOKEN}_${LOCAL_INDEX}"
+    LOCAL_NS_IF="cfn${PROBE_TOKEN}_${LOCAL_INDEX}"
+    LOCAL_NAT_CHAIN="CFN${PROBE_TOKEN}_${LOCAL_INDEX}"
+    LOCAL_FWD_CHAIN="CFF${PROBE_TOKEN}_${LOCAL_INDEX}"
+    LOCAL_WG_IF="wgp${PROBE_TOKEN}_${LOCAL_INDEX}"
+    
+    LOCAL_SUBNET_BASE=$((LOCAL_INDEX * 4))
+    LOCAL_CIDR="169.254.241.${LOCAL_SUBNET_BASE}/30"
+    LOCAL_HOST_ADDR="169.254.241.$((LOCAL_SUBNET_BASE + 1))/30"
+    LOCAL_PEER_ADDR="169.254.241.$((LOCAL_SUBNET_BASE + 2))/30"
+    LOCAL_STATE_DIR="${CFWARP_ENDPOINT_REFRESH_STATE_ROOT}/${PROBE_TOKEN}_${LOCAL_INDEX}"
+    
+    CFWARP_MODE=netns-proxy NETNS_NAME="$LOCAL_NETNS" NETNS_HOST_IF="$LOCAL_HOST_IF" \
+    NETNS_NS_IF="$LOCAL_NS_IF" CFWARP_STATE_DIR="$LOCAL_STATE_DIR" \
+    NETNS_HOST_ADDR="$LOCAL_HOST_ADDR" NETNS_PEER_ADDR="$LOCAL_PEER_ADDR" \
+    NETNS_CIDR="$LOCAL_CIDR" NAT_CHAIN="$LOCAL_NAT_CHAIN" FWD_CHAIN="$LOCAL_FWD_CHAIN" \
+    WG_QUICK_BIN="$WG_QUICK_BIN" \
+    sh "$SCRIPT_DIR/cfwarp-netns.sh" up
+
+    LOCAL_METRICS="${LOCAL_DIR}/metrics.env"
+    LOCAL_WG_CONF="${LOCAL_DIR}/${LOCAL_WG_IF}.conf"
+    if [ ! -f "$WGCF_PROFILE" ] && [ -f "$WG_CONF" ]; then
+        install -m 0600 "$WG_CONF" "$LOCAL_WG_CONF"
+    fi
+    
+    echo "==> [CFwarp] 正在评估 Endpoint: ${LOCAL_ENDPOINT}"
+    LOCAL_LOG="${LOCAL_DIR}/probe.log"
+    
+    set +e
+    if [ "$TIMEOUT_AVAILABLE" = "1" ]; then
+        run_timeout "$CFWARP_ENDPOINT_CANDIDATE_TIMEOUT_SECONDS" \
+            ip netns exec "$LOCAL_NETNS" env \
+            CFWARP_MODE=host-global WG_INTERFACE="$LOCAL_WG_IF" \
+            CFWARP_DATA_DIR="$CFWARP_DATA_DIR" WG_CONF_DIR="$LOCAL_DIR" \
+            WG_CONF="$LOCAL_WG_CONF" WGCF_PROFILE="$WGCF_PROFILE" \
+            WGCF_ACCOUNT="$WGCF_ACCOUNT" WG_QUICK_BIN="$WG_QUICK_BIN" \
+            WGCF_VERSION="${WGCF_VERSION:-}" WGCF_SHA256="${WGCF_SHA256:-}" \
+            CFWARP_ALLOW_INSECURE_WGCF_DOWNLOAD="${CFWARP_ALLOW_INSECURE_WGCF_DOWNLOAD:-0}" \
+            ENDPOINT_IP="$LOCAL_ENDPOINT" ENDPOINT_CANDIDATES= \
+            WARP_READY_ATTEMPTS="${WARP_READY_ATTEMPTS:-}" WARP_READY_DELAY_SECONDS="${WARP_READY_DELAY_SECONDS:-}" \
+            WARP_HEALTHCHECK_CONNECT_TIMEOUT="${WARP_HEALTHCHECK_CONNECT_TIMEOUT:-}" WARP_HEALTHCHECK_TOTAL_TIMEOUT="${WARP_HEALTHCHECK_TOTAL_TIMEOUT:-}" \
+            WARP_HEALTHCHECK_TRACE_URL="${WARP_HEALTHCHECK_TRACE_URL:-}" WARP_HEALTHCHECK_TEST_URL="${WARP_HEALTHCHECK_TEST_URL:-}" \
+            CFWARP_PROBE_MODE=1 CFWARP_PROBE_URL="$CFWARP_ENDPOINT_PROBE_URL" \
+            CFWARP_PROBE_SAMPLES="$CFWARP_ENDPOINT_PROBE_SAMPLES" CFWARP_PROBE_METRICS_FILE="$LOCAL_METRICS" \
+            sh "$SCRIPT_DIR/entrypoint.sh" > "$LOCAL_LOG" 2>&1
+        PROBE_STATUS=$?
+    else
+        ip netns exec "$LOCAL_NETNS" env \
+            CFWARP_MODE=host-global WG_INTERFACE="$LOCAL_WG_IF" CFWARP_DATA_DIR="$CFWARP_DATA_DIR" \
+            WG_CONF_DIR="$LOCAL_DIR" WG_CONF="$LOCAL_WG_CONF" WGCF_PROFILE="$WGCF_PROFILE" \
+            WGCF_ACCOUNT="$WGCF_ACCOUNT" WG_QUICK_BIN="$WG_QUICK_BIN" ENDPOINT_IP="$LOCAL_ENDPOINT" \
+            ENDPOINT_CANDIDATES= CFWARP_PROBE_MODE=1 CFWARP_PROBE_URL="$CFWARP_ENDPOINT_PROBE_URL" \
+            CFWARP_PROBE_SAMPLES="$CFWARP_ENDPOINT_PROBE_SAMPLES" CFWARP_PROBE_METRICS_FILE="$LOCAL_METRICS" \
+            sh "$SCRIPT_DIR/entrypoint.sh" > "$LOCAL_LOG" 2>&1
+        PROBE_STATUS=$?
+    fi
+    set -e
+    
+    if [ "$PROBE_STATUS" -ne 0 ] || [ ! -f "$LOCAL_METRICS" ]; then
+        if [ "$PROBE_STATUS" -eq 124 ]; then
+            echo "==> [CFwarp] Endpoint ${LOCAL_ENDPOINT} 评估超时，已跳过。" >&2
+        else
+            echo "==> [CFwarp] Endpoint ${LOCAL_ENDPOINT} 评估失败，已跳过。" >&2
+        fi
+        [ -f "$LOCAL_LOG" ] && sed -n '1,80p' "$LOCAL_LOG" >&2 || true
+    fi
+    
+    ip netns exec "$LOCAL_NETNS" "$WG_QUICK_BIN" down "$LOCAL_WG_IF" >/dev/null 2>&1 || true
+}
 
 BEST_ENDPOINT=
 BEST_SCORE=
@@ -207,6 +265,7 @@ BEST_HTTP_AVG=
 BEST_EXIT_IP=
 CURRENT_SCORE=
 INDEX=1
+PIDS=""
 while IFS= read -r CANDIDATE_ENDPOINT; do
     [ -n "$CANDIDATE_ENDPOINT" ] || continue
     if ! cfwarp_validate_endpoint "$CANDIDATE_ENDPOINT"; then
@@ -214,60 +273,30 @@ while IFS= read -r CANDIDATE_ENDPOINT; do
         continue
     fi
     CANDIDATE_DIR="${TMP_ROOT}/candidate-${INDEX}"
-    CANDIDATE_METRICS="${CANDIDATE_DIR}/metrics.env"
-    PROBE_WG_CONF="${CANDIDATE_DIR}/${PROBE_WG_INTERFACE}.conf"
     install -d -m 0700 "$CANDIDATE_DIR"
-    if [ ! -f "$WGCF_PROFILE" ] && [ -f "$WG_CONF" ]; then
-        install -m 0600 "$WG_CONF" "$PROBE_WG_CONF"
+    
+    run_probe_for_candidate "$INDEX" "$CANDIDATE_ENDPOINT" "$CANDIDATE_DIR" &
+    PIDS="$PIDS $!"
+    
+    INDEX=$((INDEX + 1))
+    if [ "$INDEX" -gt 60 ]; then
+        echo "==> [CFwarp] 达到候选数限制，忽略多余 Endpoint。" >&2
+        break
     fi
-    echo "==> [CFwarp] 正在评估 Endpoint: ${CANDIDATE_ENDPOINT}"
-    PROBE_LOG="${CANDIDATE_DIR}/probe.log"
-    if [ "$TIMEOUT_AVAILABLE" = "1" ]; then
-        if run_timeout "$CFWARP_ENDPOINT_CANDIDATE_TIMEOUT_SECONDS" \
-            ip netns exec "$PROBE_NETNS" env \
-            CFWARP_MODE=host-global \
-            WG_INTERFACE="$PROBE_WG_INTERFACE" \
-            CFWARP_DATA_DIR="$CFWARP_DATA_DIR" \
-            WG_CONF_DIR="$CANDIDATE_DIR" \
-            WG_CONF="$PROBE_WG_CONF" \
-            WGCF_PROFILE="$WGCF_PROFILE" \
-            WGCF_ACCOUNT="$WGCF_ACCOUNT" \
-            WG_QUICK_BIN="$WG_QUICK_BIN" \
-            WGCF_VERSION="${WGCF_VERSION:-}" \
-            WGCF_SHA256="${WGCF_SHA256:-}" \
-            CFWARP_ALLOW_INSECURE_WGCF_DOWNLOAD="${CFWARP_ALLOW_INSECURE_WGCF_DOWNLOAD:-0}" \
-            ENDPOINT_IP="$CANDIDATE_ENDPOINT" \
-            ENDPOINT_CANDIDATES= \
-            WARP_READY_ATTEMPTS="${WARP_READY_ATTEMPTS:-}" \
-            WARP_READY_DELAY_SECONDS="${WARP_READY_DELAY_SECONDS:-}" \
-            WARP_HEALTHCHECK_CONNECT_TIMEOUT="${WARP_HEALTHCHECK_CONNECT_TIMEOUT:-}" \
-            WARP_HEALTHCHECK_TOTAL_TIMEOUT="${WARP_HEALTHCHECK_TOTAL_TIMEOUT:-}" \
-            WARP_HEALTHCHECK_TRACE_URL="${WARP_HEALTHCHECK_TRACE_URL:-}" \
-            WARP_HEALTHCHECK_TEST_URL="${WARP_HEALTHCHECK_TEST_URL:-}" \
-            CFWARP_PROBE_MODE=1 \
-            CFWARP_PROBE_URL="$CFWARP_ENDPOINT_PROBE_URL" \
-            CFWARP_PROBE_SAMPLES="$CFWARP_ENDPOINT_PROBE_SAMPLES" \
-            CFWARP_PROBE_METRICS_FILE="$CANDIDATE_METRICS" \
-            sh "$SCRIPT_DIR/entrypoint.sh" > "$PROBE_LOG" 2>&1; then
-            PROBE_STATUS=0
-        else
-            PROBE_STATUS=$?
-        fi
-    else
-        echo "==> [CFwarp] 未找到 timeout，使用入口脚本自身的超时参数。" >&2
-        if ip netns exec "$PROBE_NETNS" env \
-            CFWARP_MODE=host-global WG_INTERFACE="$PROBE_WG_INTERFACE" CFWARP_DATA_DIR="$CFWARP_DATA_DIR" \
-            WG_CONF_DIR="$CANDIDATE_DIR" WG_CONF="$PROBE_WG_CONF" WGCF_PROFILE="$WGCF_PROFILE" \
-            WGCF_ACCOUNT="$WGCF_ACCOUNT" WG_QUICK_BIN="$WG_QUICK_BIN" ENDPOINT_IP="$CANDIDATE_ENDPOINT" \
-            ENDPOINT_CANDIDATES= CFWARP_PROBE_MODE=1 CFWARP_PROBE_URL="$CFWARP_ENDPOINT_PROBE_URL" \
-            CFWARP_PROBE_SAMPLES="$CFWARP_ENDPOINT_PROBE_SAMPLES" CFWARP_PROBE_METRICS_FILE="$CANDIDATE_METRICS" \
-            sh "$SCRIPT_DIR/entrypoint.sh" > "$PROBE_LOG" 2>&1; then
-            PROBE_STATUS=0
-        else
-            PROBE_STATUS=$?
-        fi
-    fi
-    if [ "$PROBE_STATUS" -eq 0 ] && [ -f "$CANDIDATE_METRICS" ]; then
+done < "$CANDIDATE_FILE"
+
+for PID in $PIDS; do
+    wait "$PID" || true
+done
+
+INDEX=1
+while IFS= read -r CANDIDATE_ENDPOINT; do
+    [ -n "$CANDIDATE_ENDPOINT" ] || continue
+    cfwarp_validate_endpoint "$CANDIDATE_ENDPOINT" || continue
+    CANDIDATE_DIR="${TMP_ROOT}/candidate-${INDEX}"
+    CANDIDATE_METRICS="${CANDIDATE_DIR}/metrics.env"
+    
+    if [ -f "$CANDIDATE_METRICS" ]; then
         SELECTED_ENDPOINT=$(metric SELECTED_ENDPOINT "$CANDIDATE_METRICS")
         READY_SECONDS=$(metric READY_SECONDS "$CANDIDATE_METRICS")
         HTTP_AVG_TOTAL=$(metric HTTP_AVG_TOTAL "$CANDIDATE_METRICS")
@@ -284,16 +313,9 @@ while IFS= read -r CANDIDATE_ENDPOINT; do
             CURRENT_SCORE=$SCORE
         fi
         echo "==> [CFwarp] Endpoint ${CANDIDATE_ENDPOINT} 评估完成: ready=${READY_SECONDS}s avg=${HTTP_AVG_TOTAL}s score=${SCORE}"
-    else
-        if [ "$PROBE_STATUS" -eq 124 ]; then
-            echo "==> [CFwarp] Endpoint ${CANDIDATE_ENDPOINT} 评估超时，已跳过。" >&2
-        else
-            echo "==> [CFwarp] Endpoint ${CANDIDATE_ENDPOINT} 评估失败，已跳过。" >&2
-        fi
-        [ -f "$PROBE_LOG" ] && sed -n '1,80p' "$PROBE_LOG" >&2 || true
     fi
-    ip netns exec "$PROBE_NETNS" "$WG_QUICK_BIN" down "$PROBE_WG_INTERFACE" >/dev/null 2>&1 || true
     INDEX=$((INDEX + 1))
+    [ "$INDEX" -gt 60 ] && break
 done < "$CANDIDATE_FILE"
 
 if [ -z "$BEST_ENDPOINT" ]; then
