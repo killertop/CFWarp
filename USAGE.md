@@ -1,239 +1,177 @@
-# CFwarp Usage
+# CFwarp 使用说明
 
-这份文档面向“其他程序/自动化脚本如何调用 CFwarp”。
-默认假设你已经通过 `install.sh` 完成裸机安装，且使用默认配置。
-当前仓库只维护裸机部署，不再提供 Docker 部署入口。
+本文假设已在 Linux 裸机上运行 `install.sh`。默认安装根目录为
+`/opt/cfwarp`，私有环境文件为 `/etc/cfwarp/cfwarp.env`，WARP 状态目录为
+`/var/lib/cfwarp`。
 
-## 1. 默认安装产物
+## 1. 运行模式
 
-- systemd 服务名：`cfwarp.service`
-- Endpoint 刷新服务：`cfwarp-endpoint-refresh.service`
-- Endpoint 刷新定时器：`cfwarp-endpoint-refresh.timer`
-- 运行根目录：`/opt/web/CFwarp`
-- 环境文件：`/opt/web/CFwarp/deploy/local/cfwarp.env`
-- 持久化状态目录：`/opt/web/CFwarp/var`
-- 命令执行助手：`/opt/web/CFwarp/bin/cfwarp-exec`
-- systemd 单元文件：`/opt/web/CFwarp/deploy/systemd/cfwarp.service`
-- systemd 链接：`/etc/systemd/system/cfwarp.service`
-- 兼容入口：`microwarp.service`、`microwarp-exec`、`microwarp.env`
+### `netns-proxy`（默认）
 
-## 2. 默认运行模式
-
-默认模式是 `netns-proxy`，不是宿主机全局模式。
-
-含义：
-
-- WARP 只在独立的 Linux network namespace 中生效
-- 宿主机默认路由不会被 CFwarp 改写
-- 宿主机上的项目需要显式连接 CFwarp 提供的 SOCKS5 代理
-
-默认 `cfwarp.env` 中的关键值：
-
-- `CFWARP_MODE=netns-proxy`
-- `NETNS_PEER_HOST=169.254.240.2`
-- `BIND_PORT=1080`
-
-额外约束：
-
-- `NETNS_HOST_IF` 和 `NETNS_NS_IF` 这两个 veth 接口名必须不超过 15 个字符，这是 Linux 内核限制
-
-因此，宿主机项目默认应连接：
+CFwarp 创建独立 network namespace、veth 和 WARP WireGuard 接口。宿主机默认
+路由不会被修改；宿主机程序通过 veth 对端访问 SOCKS5：
 
 ```text
-169.254.240.2:1080
+地址：169.254.240.2
+端口：1080
+URL：socks5h://169.254.240.2:1080
 ```
 
-如果启用了认证，则使用：
+`socks5h` 会让域名解析也通过代理完成。若启用了认证，将用户名和密码配置
+在支持 SOCKS5 认证的客户端中。veth 接口名最多 15 个字符，这是 Linux 的
+接口名限制。
+
+### `host-global`
+
+只有在环境文件中显式设置以下值时才启用：
 
 ```text
-SOCKS5 host: 169.254.240.2
-SOCKS5 port: 1080
-username: <SOCKS_USER>
-password: <SOCKS_PASS>
+CFWARP_MODE=host-global
+BIND_ADDR=127.0.0.1
 ```
 
-## 3. 推荐调用方式
+此模式让 `wg-quick` 在宿主机上处理 WireGuard 路由。若把 SOCKS5 绑定到
+通配地址，必须同时设置 `SOCKS_USER` 和 `SOCKS_PASS`。除非你明确理解路由
+和暴露面变化，否则使用默认的 `netns-proxy`。
 
-### 方式 A：程序直接使用 SOCKS5
+## 2. 应用接入
 
-适用于支持代理配置的程序。
-
-推荐优先使用：
+支持 SOCKS5 的程序应配置：
 
 ```text
 socks5h://169.254.240.2:1080
 ```
 
-如果启用了认证：
+例如：
+
+```bash
+ALL_PROXY=socks5h://169.254.240.2:1080 curl -fsS https://1.1.1.1/cdn-cgi/trace
+```
+
+不支持 SOCKS5 但可以从命令行启动的程序，使用：
+
+```bash
+/opt/cfwarp/cfwarp-exec <command> [args...]
+/opt/cfwarp/cfwarp-exec curl -fsS https://1.1.1.1/cdn-cgi/trace
+```
+
+`cfwarp-exec` 会把进程放入 CFwarp namespace。服务未启动或当前是
+`host-global` 时，它会直接报错退出。CFwarp 自身只提供 TCP SOCKS5，不提供
+UDP 代理。
+
+## 3. 常用命令
+
+```bash
+sudo systemctl start cfwarp.service
+sudo systemctl stop cfwarp.service
+sudo systemctl restart cfwarp.service
+sudo systemctl status cfwarp.service
+sudo journalctl -u cfwarp.service -n 100 --no-pager
+```
+
+健康检查：
+
+```bash
+sudo /opt/cfwarp/cfwarp-healthcheck.sh
+sudo /opt/cfwarp/cfwarp-healthcheck.sh --wait
+sudo /opt/cfwarp/cfwarp-healthcheck.sh --format env
+sudo /opt/cfwarp/cfwarp-healthcheck.sh --format env \
+  --metrics-file /run/cfwarp/health.env
+```
+
+输出中的 `CFWARP_HEALTH_OK=1` 只在 SOCKS5 请求成功且 trace 显示 WARP
+状态为 `on` 或 `plus` 时出现。`CFWARP_TOTAL_MS` 是一次 trace 请求的总耗时，
+不等同于线路带宽。
+
+自检：
+
+```bash
+sudo /opt/cfwarp/cfwarp-doctor.sh
+sudo /opt/cfwarp/cfwarp-doctor.sh --fix
+sudo /opt/cfwarp/cfwarp-doctor.sh --metrics-file /run/cfwarp/doctor.env
+```
+
+`--fix` 是保守操作，只修复 CFwarp 自身的权限和运行目录问题；不会自动改动
+其他服务、防火墙规则或宿主机路由。
+
+## 4. Endpoint 管理
+
+默认情况下，CFwarp 采用 `wgcf` profile 中的 Endpoint。可在私有环境文件中
+显式指定：
 
 ```text
-socks5h://<user>:<pass>@169.254.240.2:1080
+ENDPOINT_IP=<host-or-ip>:<port>
+ENDPOINT_CANDIDATES=<host-or-ip>:<port>,<host-or-ip>:<port>
 ```
 
-说明：
+Endpoint 必须使用 `host:port` 或 `[ipv6]:port` 格式。不要把未经验证的地址
+批量写入生产配置。
 
-- `socks5h://` 表示域名解析也走 SOCKS5 服务端，避免宿主机本地 DNS 泄漏
-- 如果你的客户端库只支持 `socks5://`，也可以使用，但 DNS 可能先在宿主机解析
-
-常见环境变量写法：
-
-```bash
-ALL_PROXY=socks5h://169.254.240.2:1080
-all_proxy=socks5h://169.254.240.2:1080
-```
-
-启用认证时：
-
-```bash
-ALL_PROXY=socks5h://user:pass@169.254.240.2:1080
-```
-
-### 方式 B：程序不支持 SOCKS5，直接进 namespace 执行
-
-适用于没有代理配置能力、但可以通过命令行启动的程序。
-
-使用：
-
-```bash
-cfwarp-exec <command> [args...]
-```
-
-示例：
-
-```bash
-cfwarp-exec curl -s https://1.1.1.1/cdn-cgi/trace
-cfwarp-exec python your_script.py
-cfwarp-exec /path/to/program --flag value
-```
-
-说明：
-
-- `cfwarp-exec` 会把目标命令放进 CFwarp 使用的同一个 network namespace
-- 进入该 namespace 后，程序默认出站就会经过 WARP
-- 如果 `cfwarp.service` 没启动，`cfwarp-exec` 会直接报错退出
-
-## 4. 服务控制
-
-启动：
-
-```bash
-systemctl start cfwarp.service
-```
-
-停止：
-
-```bash
-systemctl stop cfwarp.service
-```
-
-查看状态：
-
-```bash
-systemctl status cfwarp.service
-```
-
-查看日志：
-
-```bash
-journalctl -u cfwarp.service -n 100 --no-pager
-```
-
-手动执行一次最佳 Endpoint 选择：
-
-```bash
-systemctl start cfwarp-endpoint-refresh.service
-```
-
-查看自动选择日志：
-
-```bash
-journalctl -u cfwarp-endpoint-refresh.service -n 100 --no-pager
-```
-
-## 5. 给程序接入时应遵守的约定
-
-建议其他程序按下面的优先级接入：
-
-1. 优先使用显式 SOCKS5 代理地址 `169.254.240.2:1080`
-2. 如果程序不支持 SOCKS5，再使用 `cfwarp-exec`
-3. 不要假设宿主机已经被全局 WARP 接管
-
-程序在接入时不应假设以下行为：
-
-- 不应假设 `127.0.0.1:1080` 一定可用
-- 不应假设宿主机所有请求都会自动走 WARP
-- 不应假设 `host-global` 模式是默认模式
-
-## 6. 何时会变成宿主机全局模式
-
-只有在 `/opt/web/CFwarp/deploy/local/cfwarp.env` 中显式设置：
+自动评估默认关闭。如果启用每日定时器，推荐保留：
 
 ```text
-CFWARP_MODE=host-global
+CFWARP_ENDPOINT_REFRESH_ACTIVE_MODE=skip
 ```
 
-此时：
-
-- 宿主机主网络空间会被 WARP 接管
-- `cfwarp-exec` 不再适用
-- 这种模式不适合作为“某个项目单独走 WARP”的默认方案
-
-## 7. 最小联通性检查
-
-如果你只是想确认代理是否可用，可在宿主机执行：
-
-```bash
-curl -x socks5h://169.254.240.2:1080 https://1.1.1.1/cdn-cgi/trace
-```
-
-启用认证时：
-
-```bash
-curl -x socks5h://user:pass@169.254.240.2:1080 https://1.1.1.1/cdn-cgi/trace
-```
-
-如果你想确认 namespace 模式本身可用，可执行：
-
-```bash
-cfwarp-exec curl -s https://1.1.1.1/cdn-cgi/trace
-```
-
-## 8. 连通性调优参数
-
-如果你所在机房对默认 WARP Endpoint 不稳定，或者握手比较慢，可直接在 `/opt/web/CFwarp/deploy/local/cfwarp.env` 中加入这些参数：
+这会在 `cfwarp.service` 正常运行时跳过探测，避免定时任务主动中断代理。若
+确实需要评估当前活动隧道，才使用：
 
 ```text
-ENDPOINT_IP=162.159.192.1:4500
-ENDPOINT_CANDIDATES=162.159.192.1:2408,162.159.192.1:4500,188.114.96.7:2408
-WARP_READY_ATTEMPTS=6
-WARP_READY_DELAY_SECONDS=2
-WARP_HEALTHCHECK_CONNECT_TIMEOUT=4
-WARP_HEALTHCHECK_TOTAL_TIMEOUT=8
-WARP_HEALTHCHECK_TRACE_URL=https://1.1.1.1/cdn-cgi/trace
-WARP_HEALTHCHECK_TEST_URL=https://www.gstatic.com/generate_204
+CFWARP_ENDPOINT_REFRESH_ACTIVE_MODE=stop-and-probe
 ```
 
-说明：
+该模式会短暂停止服务，逐个探测候选，并仅在达到最小改善阈值时写入新
+Endpoint。探测结束会尝试恢复服务；若恢复失败，会回滚环境文件中的旧值。
 
-- `ENDPOINT_IP` 用于指定单个优选 Endpoint
-- `ENDPOINT_CANDIDATES` 用逗号分隔多个候选 Endpoint，CFwarp 会依次尝试
-- `WARP_READY_*` 和 `WARP_HEALTHCHECK_*` 用于控制握手等待和可用性检测
-- 在默认的 `netns-proxy` 模式下，这些参数会被传入独立 namespace 内实际运行的 WARP 进程
-- `cfwarp-endpoint-refresh.timer` 会每天运行一次，在 `ENDPOINT_IP + ENDPOINT_CANDIDATES` 中选一个当前更优的 Endpoint，并回写 `ENDPOINT_IP`
-- `CFWARP_ENDPOINT_PROBE_SAMPLES` 用于控制每日自动选择时的探测样本数
-- `CFWARP_ENDPOINT_PROBE_URL` 用于指定每日自动选择时的探测 URL
-- `CFWARP_ENDPOINT_REFRESH_ACTIVE_MODE=skip` 是默认安全值，表示当 `cfwarp.service` 正在运行时直接跳过刷新，避免为探测停掉现网代理
-- 如确实接受短时停服探测，再显式设置 `CFWARP_ENDPOINT_REFRESH_ACTIVE_MODE=stop-and-probe`
+手动运行：
 
-## 9. 供程序直接读取的关键结论
+```bash
+sudo systemctl start cfwarp-endpoint-refresh.service
+sudo journalctl -u cfwarp-endpoint-refresh.service -n 100 --no-pager
+```
 
-可直接把下面几条当作接入规则：
+## 5. 配置安全
 
-```text
-default_mode=netns-proxy
-default_socks5_host=169.254.240.2
-default_socks5_port=1080
-preferred_proxy_scheme=socks5h
-non_proxy_program_runner=cfwarp-exec
-global_host_routing=false
+环境文件是 shell 变量文件，只应由 root 创建和维护。至少保证：
+
+```bash
+sudo chmod 600 /etc/cfwarp/cfwarp.env
+sudo chmod 700 /var/lib/cfwarp
+```
+
+不要在仓库、issue、日志或截图中公开 `SOCKS_PASS`、WARP account、私钥或
+任何访问令牌。自定义安装目录应使用 root 可控路径；默认 systemd 单元启用
+PrivateTmp、NoNewPrivileges、ProtectHome 和其他沙箱限制。
+
+## 6. 故障排查
+
+按以下顺序收集信息：
+
+```bash
+sudo systemctl status cfwarp.service --no-pager
+sudo journalctl -u cfwarp.service -n 200 --no-pager
+sudo /opt/cfwarp/cfwarp-healthcheck.sh --format env
+sudo /opt/cfwarp/cfwarp-doctor.sh
+```
+
+常见原因包括 UDP 出口受限、Endpoint 不可达、namespace 或 veth 被外部脚本
+删除、SOCKS 端口冲突，以及环境文件权限不正确。不要用单次 ping 或某个测速
+站点把结果当作总带宽证明；先确认 WARP handshake、trace 和实际应用请求。
+
+## 7. 升级与清理
+
+升级前备份私有环境和数据，然后运行新版安装器：
+
+```bash
+sudo cp -a /etc/cfwarp /root/cfwarp-config-backup
+sudo cp -a /var/lib/cfwarp /root/cfwarp-data-backup
+sudo ./install.sh --start
+```
+
+`--clean-generated` 只删除安装生成的脚本、私有 `wg-quick`、`microsocks` 和
+systemd units，不删除环境文件或 WARP 数据：
+
+```bash
+sudo systemctl stop cfwarp.service
+sudo ./install.sh --clean-generated
 ```

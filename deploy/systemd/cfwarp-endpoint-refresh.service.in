@@ -1,0 +1,19 @@
+[Unit]
+Description=CFwarp Endpoint refresh (opt-in)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-@ENV_FILE@
+WorkingDirectory=@INSTALL_PREFIX@
+ExecStart=/bin/sh @INSTALL_PREFIX@/cfwarp-refresh-endpoint.sh
+TimeoutStartSec=30min
+UMask=0077
+PrivateTmp=true
+ProtectHome=read-only
+NoNewPrivileges=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native

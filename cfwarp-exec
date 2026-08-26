@@ -2,44 +2,50 @@
 set -eu
 
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
+if [ ! -r "${SCRIPT_DIR}/lib/cfwarp-common.sh" ] && [ -r "${SCRIPT_DIR}/../lib/cfwarp-common.sh" ]; then
+    SCRIPT_DIR=$(CDPATH='' cd -- "${SCRIPT_DIR}/.." && pwd)
+fi
+COMMON_FILE="${SCRIPT_DIR}/lib/cfwarp-common.sh"
+if [ ! -r "$COMMON_FILE" ]; then
+    echo "找不到共享库: $COMMON_FILE" >&2
+    exit 1
+fi
+# shellcheck disable=SC1090
+. "$COMMON_FILE"
 
 if [ $# -eq 0 ]; then
     echo "用法: cfwarp-exec <command> [args...]" >&2
     exit 1
 fi
 
-CFWARP_ENV_FILE=${CFWARP_ENV_FILE:-${MICROWARP_ENV_FILE:-"__CFWARP_ENV_FILE__"}}
-if [ "$CFWARP_ENV_FILE" = "__CFWARP_ENV_FILE__" ]; then
-    CFWARP_ENV_FILE="${SCRIPT_DIR}/deploy/local/cfwarp.env"
-fi
+CFWARP_ENV_FILE=$(cfwarp_default_env_file "$SCRIPT_DIR")
 CFWARP_MODE_OVERRIDE=${CFWARP_MODE-}
-if [ -z "${CFWARP_MODE_OVERRIDE}" ]; then
-    CFWARP_MODE_OVERRIDE=${MICROWARP_MODE-}
-fi
 NETNS_NAME_OVERRIDE=${NETNS_NAME-}
-if [ -f "$CFWARP_ENV_FILE" ]; then
+if [ -r "$CFWARP_ENV_FILE" ]; then
     set -a
     # shellcheck disable=SC1090
     . "$CFWARP_ENV_FILE"
     set +a
 fi
 
-if [ -n "${CFWARP_MODE_OVERRIDE}" ]; then
+if [ -n "$CFWARP_MODE_OVERRIDE" ]; then
     CFWARP_MODE=$CFWARP_MODE_OVERRIDE
 fi
-if [ -n "${NETNS_NAME_OVERRIDE}" ]; then
+if [ -n "$NETNS_NAME_OVERRIDE" ]; then
     NETNS_NAME=$NETNS_NAME_OVERRIDE
 fi
-
-CFWARP_MODE=${CFWARP_MODE:-${MICROWARP_MODE:-"netns-proxy"}}
-NETNS_NAME=${NETNS_NAME:-"cfwarp"}
+CFWARP_MODE=${CFWARP_MODE:-netns-proxy}
+NETNS_NAME=${NETNS_NAME:-cfwarp}
 
 if [ "$CFWARP_MODE" = "host-global" ]; then
     echo "当前 CFWARP_MODE=host-global，没有可加入的独立 namespace。" >&2
     exit 1
 fi
-
-if ! ip netns list 2>/dev/null | awk '{print $1}' | grep -Fx "$NETNS_NAME" > /dev/null 2>&1; then
+if [ "$CFWARP_MODE" != "netns-proxy" ]; then
+    echo "不支持的 CFWARP_MODE: $CFWARP_MODE" >&2
+    exit 1
+fi
+if ! ip netns list 2>/dev/null | awk '{print $1}' | grep -Fx "$NETNS_NAME" >/dev/null 2>&1; then
     echo "找不到 network namespace \"$NETNS_NAME\"。请先启动 cfwarp.service。" >&2
     exit 1
 fi

@@ -1,0 +1,5 @@
+* text=auto eol=lf
+*.sh text eol=lf
+cfwarp-exec text eol=lf
+*.service.in text eol=lf
+*.timer.in text eol=lf

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run CFwarp Endpoint refresh daily
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=30m
+Persistent=true
+Unit=cfwarp-endpoint-refresh.service
+
+[Install]
+WantedBy=timers.target

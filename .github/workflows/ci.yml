@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Run smoke tests
+        run: make test
+
+      - name: ShellCheck
+        run: |
+          shellcheck --severity=error \
+            entrypoint.sh cfwarp-start.sh cfwarp-stop.sh cfwarp-netns.sh \
+            cfwarp-refresh-endpoint.sh cfwarp-healthcheck.sh \
+            cfwarp-watchdog.sh cfwarp-doctor.sh cfwarp-exec install.sh \
+            lib/cfwarp-common.sh tests/smoke.sh
+
+      - name: Check diff whitespace
+        run: git diff --check
+
+      - name: Check for private material
+        shell: bash
+        run: |
+          set -euo pipefail
+          private_word=hack
+          private_word="${private_word}ertop"
+          private_ip='134.195'
+          private_ip="${private_ip}.209.158"
+          private_key_prefix=BEGIN
+          private_key_prefix="${private_key_prefix} (RSA|OPENSSH|EC|DSA) PRIVATE KEY"
+          private_feature=CFWARP_
+          private_feature="${private_feature}OPENAI"
+          private_path=/opt
+          private_path="${private_path}/web/CFwarp"
+          if rg -n --hidden --glob '!.git/**' \
+            -e "$private_word" \
+            -e "$private_ip" \
+            -e "$private_key_prefix" \
+            -e "$private_feature" \
+            -e "$private_path" .; then
+            echo 'private or server-specific material found' >&2
+            exit 1
+          fi

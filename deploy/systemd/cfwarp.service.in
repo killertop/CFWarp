@@ -1,0 +1,33 @@
+[Unit]
+Description=CFwarp WARP SOCKS5 proxy
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=15min
+StartLimitBurst=3
+
+[Service]
+Type=simple
+EnvironmentFile=-@ENV_FILE@
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:@BIN_DIR@
+WorkingDirectory=@INSTALL_PREFIX@
+ExecStart=/bin/sh @INSTALL_PREFIX@/cfwarp-start.sh
+ExecStartPost=/bin/sh @INSTALL_PREFIX@/cfwarp-healthcheck.sh --wait
+ExecStopPost=/bin/sh @INSTALL_PREFIX@/cfwarp-stop.sh
+Restart=on-failure
+RestartSec=30s
+TimeoutStartSec=180
+TimeoutStopSec=30s
+UMask=0077
+PrivateTmp=true
+ProtectHome=read-only
+NoNewPrivileges=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+# The service deliberately runs as root: namespace, WireGuard, sysctl and
+# iptables setup require networking capabilities.
+
+[Install]
+WantedBy=multi-user.target

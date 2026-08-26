@@ -1,0 +1,18 @@
+[Unit]
+Description=CFwarp runtime health watchdog
+After=cfwarp.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-@ENV_FILE@
+WorkingDirectory=@INSTALL_PREFIX@
+ExecStart=/bin/sh @INSTALL_PREFIX@/cfwarp-watchdog.sh
+TimeoutStartSec=6min
+UMask=0077
+PrivateTmp=true
+ProtectHome=read-only
+NoNewPrivileges=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native

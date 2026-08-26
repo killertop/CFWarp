@@ -1,215 +1,124 @@
 # CFwarp
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> 请严格遵守你所在国家和地区的法律法规。任何因违法违规使用本项目而引发的法律纠纷或后果，均与本项目及作者无关。  
-> Please comply with the laws and regulations of your jurisdiction. Any legal issues caused by illegal use are the user's own responsibility.
+CFwarp 是面向 Linux 裸机的 Cloudflare WARP 出站代理。它使用内核态
+WireGuard 和轻量级 TCP SOCKS5 服务，在默认的独立 network namespace 中为
+指定程序提供 WARP 出口，不改写宿主机默认路由。
 
-[English](#english) | [中文说明](#chinese)
+本项目源自 [MicroWARP](https://github.com/ccbkkb/MicroWARP)，保留其 MIT
+许可证与署名，当前代码按独立的 CFwarp 裸机发行方式维护。详见
+[NOTICE.md](NOTICE.md) 和 [PROJECT.md](PROJECT.md)。
 
-CFwarp 是一个面向 Linux 服务器的 Cloudflare WARP 出站代理项目。  
-它使用内核态 WireGuard 和 `microsocks` 提供低资源占用的 WARP 出口，并以 `systemd + netns` 作为默认部署模型。
+> 请遵守适用的法律法规及服务条款。CFwarp 不提供匿名性或合规性保证。
 
-当前仓库只维护 Linux 裸机部署路径，不再提供 Docker 部署能力。
+## 特性与边界
 
----
+- Linux + systemd 裸机部署；不包含 Docker 镜像或 Compose 流程。
+- 默认 `netns-proxy`：WARP 仅在独立 namespace 中运行，宿主机路由保持不变。
+- 可选 `host-global`：只有显式配置时才接管宿主机 WireGuard 路由。
+- 提供 TCP SOCKS5；不实现 UDP 转发。
+- 使用固定版本的 `wgcf`，默认架构带内置 SHA256 校验。
+- 可选 Endpoint 评估；默认不在现网服务运行时停机探测。
+- 自带健康检查、保守的 watchdog 和只读优先的 doctor 工具。
 
-<a name="english"></a>
-## English
-
-CFwarp is a lightweight Cloudflare WARP egress proxy for Linux hosts.
-It combines kernel WireGuard with `microsocks` and defaults to a dedicated network namespace instead of rewriting the host's main routing table.
-
-### What It Provides
-
-1. Low-overhead WARP egress for selected applications
-2. A local SOCKS5 endpoint for host-side programs
-3. A `cfwarp-exec` helper for programs that cannot speak SOCKS
-4. Optional `host-global` mode when you explicitly want host-wide takeover
-5. An optional daily Endpoint refresh timer for unstable datacenter networks
-
-### Deployment Model
-
-CFwarp now supports bare-metal Linux only.
-
-Requirements:
-
-1. `systemd`
-2. `wireguard-tools`
-3. `iproute2`
-4. `iptables`
-5. a Linux kernel that supports network namespaces and WireGuard
-
-Quick start:
+## 快速开始
 
 ```bash
-chmod +x install.sh
+git clone https://github.com/killertop/CFWarp.git
+cd CFWarp
 sudo ./install.sh
-sudo systemctl start cfwarp.service
+sudo editor /etc/cfwarp/cfwarp.env
+sudo systemctl enable --now cfwarp.service
 ```
 
-The installer will:
+安装器默认使用以下路径：
 
-1. install required system packages
-2. build and install `microsocks`
-3. reuse the repository directory as the runtime root
-4. store persistent WARP state under `<repo>/var`
-5. generate `<repo>/deploy/local/cfwarp.env`
-6. generate `<repo>/deploy/systemd/cfwarp.service`
-7. generate `<repo>/deploy/systemd/cfwarp-endpoint-refresh.service`
-8. generate `<repo>/deploy/systemd/cfwarp-endpoint-refresh.timer`
-9. link these units into `/etc/systemd/system`
+| 内容 | 默认路径 |
+| --- | --- |
+| 运行脚本 | `/opt/cfwarp` |
+| 私有环境文件 | `/etc/cfwarp/cfwarp.env`，权限 0600 |
+| WARP 账户和 WireGuard 状态 | `/var/lib/cfwarp`，权限 0700 |
+| systemd units | `/etc/systemd/system` |
 
-### Default Runtime Behavior
+首次启动时，CFwarp 会下载并校验固定版本的 `wgcf`，生成 WARP 账户和
+WireGuard 配置。账户文件、私钥、密码和运行日志都不应提交到 Git。
 
-Default mode is `CFWARP_MODE=netns-proxy`:
+## 最小配置
 
-1. WARP only lives inside a dedicated Linux network namespace
-2. the host default route is not rewritten
-3. host applications connect to `${NETNS_PEER_HOST}:${BIND_PORT}`
-4. programs without SOCKS support can be launched with `cfwarp-exec <command...>`
-
-If you explicitly need host-wide takeover, set `CFWARP_MODE=host-global` in `<repo>/deploy/local/cfwarp.env`.
-
-The daily refresh timer is not enabled by default. If you enable it manually, the safe default is `CFWARP_ENDPOINT_REFRESH_ACTIVE_MODE=skip`, which skips refresh while `cfwarp.service` is active instead of causing downtime.
-
-For application integration and the default SOCKS5 endpoint, see [USAGE.md](./USAGE.md).
-
-### Advanced Configuration
-
-These keys are commonly adjusted in `<repo>/deploy/local/cfwarp.env`:
+安装器会从 [deploy/cfwarp.env.example](deploy/cfwarp.env.example) 创建私有
+环境文件。默认配置会在 namespace 内监听 `169.254.240.2:1080`，宿主机程序
+使用：
 
 ```text
-BIND_ADDR=0.0.0.0
-BIND_PORT=1080
-SOCKS_USER=
-SOCKS_PASS=
-GH_PROXY=
-ENDPOINT_IP=162.159.192.1:4500
-ENDPOINT_CANDIDATES=162.159.192.1:2408,162.159.192.1:4500,188.114.96.7:2408
-WARP_READY_ATTEMPTS=6
-WARP_READY_DELAY_SECONDS=2
-WARP_HEALTHCHECK_CONNECT_TIMEOUT=4
-WARP_HEALTHCHECK_TOTAL_TIMEOUT=8
-WARP_HEALTHCHECK_TRACE_URL=https://1.1.1.1/cdn-cgi/trace
-WARP_HEALTHCHECK_TEST_URL=https://www.gstatic.com/generate_204
-CFWARP_ENDPOINT_PROBE_SAMPLES=2
-CFWARP_ENDPOINT_PROBE_URL=https://1.1.1.1/cdn-cgi/trace
-CFWARP_ENDPOINT_REFRESH_ACTIVE_MODE=skip
+socks5h://169.254.240.2:1080
 ```
 
-### HTTP Proxy Conversion
+如果需要认证，同时设置 `SOCKS_USER` 和 `SOCKS_PASS`，并确保环境文件权限为
+0600。`host-global` 模式下禁止无认证监听通配地址；生产环境也不建议把
+无认证 SOCKS5 暴露到公网。
 
-CFwarp only ships a SOCKS5 endpoint. If you need HTTP proxy compatibility, add a separate converter such as `gost`:
-
-```bash
-nohup gost -F=socks5://169.254.240.2:1080 -L=http://127.0.0.1:8081 > /dev/null 2>&1 &
-```
-
----
-
-<a name="chinese"></a>
-## 中文说明
-
-CFwarp 是一个面向 Linux 服务器的 Cloudflare WARP 出站代理。  
-它基于内核态 WireGuard 和 `microsocks`，默认通过独立 network namespace 为指定程序提供 WARP 出口，而不是直接接管宿主机全局流量。
-
-### 项目定位
-
-当前仓库只维护 Linux 裸机部署路径，不再提供 Docker 部署功能。
-
-它主要解决这几件事：
-
-1. 给指定项目提供低资源占用的 WARP 出口
-2. 给宿主机程序提供本地 SOCKS5 入口
-3. 给不支持代理的程序提供 `cfwarp-exec`
-4. 在需要时支持显式切换到 `host-global`
-5. 通过可选的每日 Endpoint 刷新缓解机房链路波动
-
-### 部署要求
-
-需要：
-
-1. `systemd`
-2. `wireguard-tools`
-3. `iproute2`
-4. `iptables`
-5. 支持 network namespace 和 WireGuard 的 Linux 内核
-
-快速安装：
-
-```bash
-chmod +x install.sh
-sudo ./install.sh
-sudo systemctl start cfwarp.service
-```
-
-安装脚本会完成这些事：
-
-1. 安装系统依赖
-2. 编译并安装 `microsocks`
-3. 复用仓库目录本身作为运行根目录
-4. 将 WARP 持久化状态放到 `<repo>/var`
-5. 生成 `<repo>/deploy/local/cfwarp.env`
-6. 生成 `<repo>/deploy/systemd/cfwarp.service`
-7. 生成 `<repo>/deploy/systemd/cfwarp-endpoint-refresh.service`
-8. 生成 `<repo>/deploy/systemd/cfwarp-endpoint-refresh.timer`
-9. 在 `/etc/systemd/system` 下建立链接
-
-### 默认运行方式
-
-默认模式是 `CFWARP_MODE=netns-proxy`：
-
-1. WARP 只在独立的 Linux network namespace 中生效
-2. 宿主机默认路由不会被改写
-3. 宿主机上的项目应连接 `${NETNS_PEER_HOST}:${BIND_PORT}`
-4. 不支持 SOCKS 的程序可使用 `cfwarp-exec <command...>`
-
-如果你明确需要宿主机全局模式，再把 `<repo>/deploy/local/cfwarp.env` 中的 `CFWARP_MODE` 改成 `host-global`。
-
-每日自动刷新默认不会自动启用；如果你手动启用，安全默认值 `CFWARP_ENDPOINT_REFRESH_ACTIVE_MODE=skip` 会在服务运行中直接跳过刷新，避免为探测停掉现网代理。
-
-程序接入方式、默认 SOCKS5 地址和 `cfwarp-exec` 的使用方式，见 [USAGE.md](./USAGE.md)。
-
-### 常用配置项
-
-这些配置通常直接写到 `<repo>/deploy/local/cfwarp.env`：
+常用配置示例：
 
 ```text
-BIND_ADDR=0.0.0.0
+CFWARP_MODE=netns-proxy
+BIND_ADDR=169.254.240.2
 BIND_PORT=1080
-SOCKS_USER=
-SOCKS_PASS=
-GH_PROXY=
-ENDPOINT_IP=162.159.192.1:4500
-ENDPOINT_CANDIDATES=162.159.192.1:2408,162.159.192.1:4500,188.114.96.7:2408
-WARP_READY_ATTEMPTS=6
-WARP_READY_DELAY_SECONDS=2
-WARP_HEALTHCHECK_CONNECT_TIMEOUT=4
-WARP_HEALTHCHECK_TOTAL_TIMEOUT=8
-WARP_HEALTHCHECK_TRACE_URL=https://1.1.1.1/cdn-cgi/trace
-WARP_HEALTHCHECK_TEST_URL=https://www.gstatic.com/generate_204
-CFWARP_ENDPOINT_PROBE_SAMPLES=2
-CFWARP_ENDPOINT_PROBE_URL=https://1.1.1.1/cdn-cgi/trace
-CFWARP_ENDPOINT_REFRESH_ACTIVE_MODE=skip
+# SOCKS_USER=<private-user>
+# SOCKS_PASS=<private-password>
+# ENDPOINT_IP=<host-or-ip>:<port>
+# ENDPOINT_CANDIDATES=<host-or-ip>:<port>,<host-or-ip>:<port>
 ```
 
-### 转成 HTTP 代理
+完整参数与接入示例见 [USAGE.md](USAGE.md)。
 
-CFwarp 只提供 SOCKS5。若你需要 HTTP 代理兼容层，可以额外用 `gost` 做转换：
+## 服务管理与诊断
 
 ```bash
-nohup gost -F=socks5://169.254.240.2:1080 -L=http://127.0.0.1:8081 > /dev/null 2>&1 &
+sudo systemctl status cfwarp.service
+sudo journalctl -u cfwarp.service -n 100 --no-pager
+sudo /opt/cfwarp/cfwarp-healthcheck.sh --wait
+sudo /opt/cfwarp/cfwarp-doctor.sh
 ```
 
----
+健康检查会同时确认 SOCKS5 可达、WARP trace 状态和测试请求。doctor 默认只
+检查；`--fix` 仅处理脚本/目录权限和可恢复的运行目录问题，不会修改其他项目
+的防火墙、路由或代理配置：
 
-## Star History
+```bash
+sudo /opt/cfwarp/cfwarp-doctor.sh --fix
+```
 
-<a href="https://star-history.com/#ccbkkb/MicroWARP&Date">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=ccbkkb/MicroWARP&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=ccbkkb/MicroWARP&type=Date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=ccbkkb/MicroWARP&type=Date" />
-  </picture>
-</a>
+watchdog 默认每 5 分钟运行一次，连续失败后才重启 CFwarp，并带有冷却时间。
+手动停止服务时不会自动拉起。Endpoint 刷新定时器默认不启用；如需启用，先
+阅读 [USAGE.md](USAGE.md) 中关于短暂停机探测的说明。
+
+## 安全与升级
+
+- 只把 `deploy/cfwarp.env.example` 提交到仓库；不要提交 `cfwarp.env`、WARP
+  账户、WireGuard 私钥、运行目录或本地二进制。
+- 默认 `wgcf` 版本不使用 `latest`。自定义版本应同时提供并核对
+  `WGCF_SHA256`。
+- 通过 `--prefix` 或 `--data-dir` 自定义路径时，应使用 root 可控且不在用户
+  home 下的目录，以便匹配 systemd 沙箱策略。
+- 升级前先备份 `/etc/cfwarp/cfwarp.env` 和 `/var/lib/cfwarp`，然后重新运行
+  安装器；安装器会复用已有账户和配置。
+- 删除安装生成物：
+
+  ```bash
+  sudo systemctl stop cfwarp.service
+  sudo ./install.sh --clean-generated
+  ```
+
+  该命令不会删除私有环境文件或 WARP 数据。
+
+## 开发检查
+
+本仓库不包含运行时账户或编译产物。提交前运行：
+
+```bash
+make test
+```
+
+发布流程还会执行 shell 语法检查、差异空白检查和敏感信息扫描。贡献方式见
+[CONTRIBUTING.md](CONTRIBUTING.md)，安全问题请见 [SECURITY.md](SECURITY.md)。

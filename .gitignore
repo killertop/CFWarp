@@ -1,4 +1,20 @@
-bin/
-var/
-deploy/local/
-deploy/systemd/
+# OS/editor noise
+.DS_Store
+*~
+*.swp
+*.swo
+
+# Runtime state, credentials and locally built artifacts
+/bin/
+/var/
+/deploy/local/
+*.env
+*.log
+*.pid
+*.orig
+*.bak*
+
+# Generated systemd units; keep source templates in the repository.
+/deploy/systemd/*.service
+/deploy/systemd/*.timer
+!deploy/systemd/*.in
