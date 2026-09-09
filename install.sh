@@ -16,6 +16,7 @@ ENV_DIR=${CFWARP_ENV_DIR:-/etc/cfwarp}
 SYSTEMD_DIR=${CFWARP_SYSTEMD_DIR:-/etc/systemd/system}
 BIN_DIR=${CFWARP_BIN_DIR:-}
 DATA_DIR_SET=0
+[ -z "${CFWARP_DATA_DIR+x}" ] || DATA_DIR_SET=1
 
 ENABLE_SERVICE=1
 ENABLE_REFRESH_TIMER=0
@@ -140,6 +141,11 @@ validate_path() {
         /*) ;;
         *) echo "==> [ERROR] $1 必须是绝对路径: $2" >&2; exit 1 ;;
     esac
+    case "$2" in
+        /|*/../*|*/..|*/./*|*/.|*[!A-Za-z0-9_./-]*)
+            echo "==> [ERROR] $1 must be a non-root absolute path using letters, digits, /, _, . and -." >&2
+            exit 1 ;;
+    esac
 }
 
 validate_paths() {
@@ -159,11 +165,11 @@ install_deps() {
     if command -v apt-get >/dev/null 2>&1; then
         export DEBIAN_FRONTEND=noninteractive
         apt-get update
-        apt-get install -y bash ca-certificates curl git build-essential wireguard-tools iproute2 iptables coreutils
+        apt-get install -y bash ca-certificates curl git build-essential wireguard-tools iproute2 iptables coreutils util-linux
     elif command -v apk >/dev/null 2>&1; then
-        apk add --no-cache bash ca-certificates curl git build-base wireguard-tools iproute2 iptables coreutils
+        apk add --no-cache bash ca-certificates curl git build-base wireguard-tools iproute2 iptables coreutils util-linux
     else
-        echo "当前仅自动支持 apt-get 和 apk。请手动安装 bash ca-certificates curl git gcc make wireguard-tools iproute2 iptables coreutils。" >&2
+        echo "当前仅自动支持 apt-get 和 apk。请手动安装 bash ca-certificates curl git gcc make wireguard-tools iproute2 iptables coreutils util-linux。" >&2
         exit 1
     fi
 }
@@ -191,7 +197,8 @@ build_microsocks() {
         [ "$ACTUAL_COMMIT" = "$MICROSOCKS_COMMIT" ] || { echo "==> [ERROR] microsocks commit 校验失败。" >&2; exit 1; }
         make CFLAGS="$MICROSOCKS_CFLAGS"
         install -d "$BIN_DIR"
-        install -m 0755 microsocks "${BIN_DIR}/microsocks"
+        install -m 0755 microsocks "${BIN_DIR}/.microsocks.new.$$"
+        mv -f "${BIN_DIR}/.microsocks.new.$$" "${BIN_DIR}/microsocks"
     )
     trap - EXIT HUP INT TERM
     cleanup_build
@@ -222,10 +229,13 @@ install_private_wg_quick() {
 
 ensure_env_file() {
     if [ "$DATA_DIR_SET" = "0" ] && [ -f "$ENV_FILE" ]; then
-        EXISTING_DATA_DIR=$(sed -n 's/^CFWARP_DATA_DIR=//p' "$ENV_FILE" | tail -n 1)
-        case "$EXISTING_DATA_DIR" in
-            /*) DATA_DIR=$EXISTING_DATA_DIR ;;
-        esac
+        # Parse quoted assignments with the same grammar used by the runtime.
+        cfwarp_parse_env "$ENV_FILE" >/dev/null || exit 1
+        EXISTING_DATA_DIR=$(cfwarp_read_env_key CFWARP_DATA_DIR "$ENV_FILE" || true)
+        if [ -n "$EXISTING_DATA_DIR" ]; then
+            validate_path CFWARP_DATA_DIR "$EXISTING_DATA_DIR"
+            DATA_DIR=$EXISTING_DATA_DIR
+        fi
     fi
     install -d -m 0700 "$ENV_DIR" "$DATA_DIR"
     if [ ! -f "$ENV_FILE" ]; then
@@ -239,11 +249,12 @@ ensure_env_file() {
 install_file() {
     CFWARP_SOURCE=$1
     CFWARP_DESTINATION=$2
-    CFWARP_MODE=$3
+    CFWARP_INSTALL_MODE=$3
     if [ "$CFWARP_SOURCE" != "$CFWARP_DESTINATION" ]; then
-        install -D -m "$CFWARP_MODE" "$CFWARP_SOURCE" "$CFWARP_DESTINATION"
+        install -D -m "$CFWARP_INSTALL_MODE" "$CFWARP_SOURCE" "${CFWARP_DESTINATION}.new.$$"
+        mv -f "${CFWARP_DESTINATION}.new.$$" "$CFWARP_DESTINATION"
     else
-        chmod "$CFWARP_MODE" "$CFWARP_DESTINATION"
+        chmod "$CFWARP_INSTALL_MODE" "$CFWARP_DESTINATION"
     fi
 }
 
@@ -273,10 +284,23 @@ install_runtime_files() {
         install_file "${SCRIPT_DIR}/${script}" "${INSTALL_PREFIX}/${script}" 0755
     done
     install_file "${SCRIPT_DIR}/cfwarp-exec" "${INSTALL_PREFIX}/cfwarp-exec" 0755
+    install_file "${SCRIPT_DIR}/cmd/cfwarp" "${INSTALL_PREFIX}/cfwarp" 0755
     if [ "${BIN_DIR}/cfwarp-exec" != "${INSTALL_PREFIX}/cfwarp-exec" ]; then
         ln -sfn "${INSTALL_PREFIX}/cfwarp-exec" "${BIN_DIR}/cfwarp-exec"
     fi
+    if [ "${BIN_DIR}/cfwarp" != "${INSTALL_PREFIX}/cfwarp" ]; then
+        ln -sfn "${INSTALL_PREFIX}/cfwarp" "${BIN_DIR}/cfwarp"
+    fi
     ensure_env_file
+    install -d -m 0755 "${INSTALL_PREFIX}/deploy"
+    CFWARP_MARKER="${INSTALL_PREFIX}/deploy/installation.env"
+    CFWARP_MARKER_TMP=$(mktemp)
+    : > "$CFWARP_MARKER_TMP"
+    cfwarp_set_env_key CFWARP_ENV_FILE "$ENV_FILE" "$CFWARP_MARKER_TMP"
+    cfwarp_set_env_key WG_QUICK_BIN "${BIN_DIR}/wg-quick" "$CFWARP_MARKER_TMP"
+    cfwarp_set_env_key MICROSOCKS_BIN "${BIN_DIR}/microsocks" "$CFWARP_MARKER_TMP"
+    install_file "$CFWARP_MARKER_TMP" "$CFWARP_MARKER" 0644
+    rm -f "$CFWARP_MARKER_TMP"
     render_template "${TEMPLATE_DIR}/cfwarp.service.in" "$SYSTEMD_UNIT"
     render_template "${TEMPLATE_DIR}/cfwarp-endpoint-refresh.service.in" "$REFRESH_UNIT"
     render_template "${TEMPLATE_DIR}/cfwarp-endpoint-refresh.timer.in" "$REFRESH_TIMER"
@@ -286,7 +310,12 @@ install_runtime_files() {
 
 clean_generated() {
     require_root
+    acquire_install_lock
     if systemd_available; then
+        systemctl stop cfwarp-watchdog.timer cfwarp-endpoint-refresh.timer >/dev/null 2>&1 || true
+        for CFWARP_CLEAN_UNIT in cfwarp-watchdog.service cfwarp-endpoint-refresh.service; do
+            if systemctl is-active --quiet "$CFWARP_CLEAN_UNIT"; then systemctl stop "$CFWARP_CLEAN_UNIT"; fi
+        done
         if systemctl is-active --quiet cfwarp.service; then
             if [ "$FORCE_CLEAN" != "1" ]; then
                 echo "cfwarp.service 正在运行，拒绝清理；请先停止服务或加 --force。" >&2
@@ -295,11 +324,13 @@ clean_generated() {
             systemctl stop cfwarp.service
         fi
         systemctl disable --now cfwarp-watchdog.timer cfwarp-endpoint-refresh.timer >/dev/null 2>&1 || true
-        systemctl disable cfwarp.service >/dev/null 2>&1 || true
+        systemctl disable cfwarp.service cfwarp-watchdog.service cfwarp-endpoint-refresh.service >/dev/null 2>&1 || true
     fi
     rm -f "$SYSTEMD_UNIT" "$REFRESH_UNIT" "$REFRESH_TIMER" "$WATCHDOG_UNIT" "$WATCHDOG_TIMER"
     rm -f "${BIN_DIR}/cfwarp-exec" "${BIN_DIR}/microsocks" "${BIN_DIR}/wg-quick"
+    rm -f "${BIN_DIR}/cfwarp" "${INSTALL_PREFIX}/cfwarp"
     rm -f "${INSTALL_PREFIX}/cfwarp-exec" "${INSTALL_PREFIX}/entrypoint.sh" "${INSTALL_PREFIX}/cfwarp-start.sh" "${INSTALL_PREFIX}/cfwarp-stop.sh" "${INSTALL_PREFIX}/cfwarp-netns.sh" "${INSTALL_PREFIX}/cfwarp-refresh-endpoint.sh" "${INSTALL_PREFIX}/cfwarp-healthcheck.sh" "${INSTALL_PREFIX}/cfwarp-watchdog.sh" "${INSTALL_PREFIX}/cfwarp-doctor.sh"
+    rm -f "${INSTALL_PREFIX}/lib/cfwarp-common.sh" "${INSTALL_PREFIX}/deploy/installation.env"
     systemd_available && systemctl daemon-reload || true
     echo "已清理 CFwarp 生成物；未删除环境文件和 WARP 数据目录。"
 }
@@ -309,6 +340,9 @@ reload_and_enable() {
         echo "未检测到运行中的 systemd，已安装文件但未执行 daemon-reload/enable/start。"
         return 0
     fi
+    if [ "$SYSTEMD_DIR" != /etc/systemd/system ]; then
+        systemctl link "$SYSTEMD_UNIT" "$REFRESH_UNIT" "$REFRESH_TIMER" "$WATCHDOG_UNIT" "$WATCHDOG_TIMER"
+    fi
     systemctl daemon-reload
     [ "$ENABLE_SERVICE" = "1" ] && systemctl enable cfwarp.service
     if [ "$ENABLE_REFRESH_TIMER" = "1" ]; then
@@ -317,13 +351,56 @@ reload_and_enable() {
     if [ "$ENABLE_WATCHDOG_TIMER" = "1" ]; then
         systemctl enable --now cfwarp-watchdog.timer
     fi
-    if [ "$START_SERVICE" = "1" ]; then
+    if [ "$START_SERVICE" = "1" ] || [ "${SERVICE_WAS_ACTIVE:-0}" = 1 ]; then
         if systemctl is-active --quiet cfwarp.service; then
             systemctl restart cfwarp.service
         else
             systemctl start cfwarp.service
         fi
     fi
+    for CFWARP_TIMER in ${ACTIVE_TIMERS:-}; do
+        systemctl start "$CFWARP_TIMER"
+    done
+}
+
+stop_for_upgrade() {
+    SERVICE_WAS_ACTIVE=0
+    ACTIVE_TIMERS=
+    systemd_available || return 0
+    systemctl is-active --quiet cfwarp.service && SERVICE_WAS_ACTIVE=1
+    for CFWARP_TIMER in cfwarp-watchdog.timer cfwarp-endpoint-refresh.timer; do
+        if systemctl is-active --quiet "$CFWARP_TIMER"; then
+            ACTIVE_TIMERS="${ACTIVE_TIMERS} $CFWARP_TIMER"
+            systemctl stop "$CFWARP_TIMER"
+        fi
+    done
+    for CFWARP_UNIT in cfwarp-watchdog.service cfwarp-endpoint-refresh.service; do
+        if systemctl is-active --quiet "$CFWARP_UNIT"; then systemctl stop "$CFWARP_UNIT"; fi
+    done
+    if [ "$SERVICE_WAS_ACTIVE" = 1 ]; then
+        # Run the previous release cleanup before replacing its state reader.
+        systemctl stop cfwarp.service
+        if [ -f "$ENV_FILE" ] && [ "$(cfwarp_read_env_key CFWARP_MODE "$ENV_FILE" || true)" = host-global ]; then
+            CFWARP_OLD_IF=$(cfwarp_read_env_key WG_INTERFACE "$ENV_FILE" || true)
+            CFWARP_OLD_IF=${CFWARP_OLD_IF:-wg0}
+            cfwarp_validate_link_name "$CFWARP_OLD_IF" || exit 1
+            CFWARP_OLD_DATA=$(cfwarp_read_env_key CFWARP_DATA_DIR "$ENV_FILE" || true)
+            CFWARP_OLD_CONF_DIR=$(cfwarp_read_env_key WG_CONF_DIR "$ENV_FILE" || true)
+            CFWARP_OLD_CONF=$(cfwarp_read_env_key WG_CONF "$ENV_FILE" || true)
+            CFWARP_OLD_CONF=${CFWARP_OLD_CONF:-${CFWARP_OLD_CONF_DIR:-${CFWARP_OLD_DATA:-$DATA_DIR}}/${CFWARP_OLD_IF}.conf}
+            if wg show "$CFWARP_OLD_IF" >/dev/null 2>&1; then
+                # Compensate for the old release down-by-interface bug.
+                "${BIN_DIR}/wg-quick" down "$CFWARP_OLD_CONF"
+            fi
+        fi
+    fi
+}
+
+acquire_install_lock() {
+    command -v flock >/dev/null 2>&1 || { echo 'flock is required (util-linux).' >&2; exit 1; }
+    install -d -m 0755 /run/lock
+    exec 9>/run/lock/cfwarp-install.lock
+    flock -n 9 || { echo 'Another CFwarp installation is running.' >&2; exit 1; }
 }
 
 print_summary() {
@@ -335,6 +412,7 @@ CFwarp 安装文件已准备完成:
   SOCKS5: ${BIN_DIR}/microsocks
   私有 wg-quick: ${BIN_DIR}/wg-quick
   命令执行助手: ${INSTALL_PREFIX}/cfwarp-exec
+  管理命令: ${BIN_DIR}/cfwarp
   systemd unit: ${SYSTEMD_UNIT}
   健康检查: ${INSTALL_PREFIX}/cfwarp-healthcheck.sh
   自检: ${INSTALL_PREFIX}/cfwarp-doctor.sh
@@ -345,10 +423,13 @@ EOF
 }
 
 if [ "$RUN_DOCTOR" = "1" ]; then
+    CFWARP_DOCTOR_SCRIPT="${INSTALL_PREFIX}/cfwarp-doctor.sh"
+    [ -f "$CFWARP_DOCTOR_SCRIPT" ] || CFWARP_DOCTOR_SCRIPT="${SCRIPT_DIR}/cfwarp-doctor.sh"
+    export CFWARP_ENV_FILE="$ENV_FILE" WG_QUICK_BIN="${BIN_DIR}/wg-quick" MICROSOCKS_BIN="${BIN_DIR}/microsocks"
     if [ "$RUN_DOCTOR_FIX" = "1" ]; then
-        exec "${SCRIPT_DIR}/cfwarp-doctor.sh" --fix
+        exec sh "$CFWARP_DOCTOR_SCRIPT" --fix
     fi
-    exec "${SCRIPT_DIR}/cfwarp-doctor.sh"
+    exec sh "$CFWARP_DOCTOR_SCRIPT"
 fi
 if [ "$RUN_CLEAN_GENERATED" = "1" ]; then
     validate_paths
@@ -359,7 +440,14 @@ fi
 require_root
 validate_paths
 install_deps
+acquire_install_lock
+cfwarp_parse_env "$ENV_TEMPLATE" >/dev/null
+if [ -f "$ENV_FILE" ]; then cfwarp_parse_env "$ENV_FILE" >/dev/null; fi
+for CFWARP_SOURCE_SCRIPT in "$SCRIPT_DIR"/*.sh "$SCRIPT_DIR/cfwarp-exec" "$SCRIPT_DIR/lib/cfwarp-common.sh"; do
+    sh -n "$CFWARP_SOURCE_SCRIPT"
+done
 build_microsocks
+stop_for_upgrade
 install_private_wg_quick
 install_runtime_files
 reload_and_enable

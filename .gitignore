@@ -8,6 +8,7 @@
 /bin/
 /var/
 /deploy/local/
+/deploy/installation.env
 *.env
 *.log
 *.pid

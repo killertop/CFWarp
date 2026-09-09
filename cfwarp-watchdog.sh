@@ -2,6 +2,12 @@
 set -eu
 
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
+COMMON_FILE="${SCRIPT_DIR}/lib/cfwarp-common.sh"
+[ -r "$COMMON_FILE" ] || { echo "==> [ERROR] 找不到共享库: $COMMON_FILE" >&2; exit 1; }
+# shellcheck disable=SC1090
+. "$COMMON_FILE"
+cfwarp_load_env "$SCRIPT_DIR" || exit 1
+
 CFWARP_SERVICE_NAME=${CFWARP_SERVICE_NAME:-cfwarp.service}
 CFWARP_WATCHDOG_RETRIES=${CFWARP_WATCHDOG_RETRIES:-3}
 CFWARP_WATCHDOG_RETRY_DELAY_SECONDS=${CFWARP_WATCHDOG_RETRY_DELAY_SECONDS:-2}
@@ -117,7 +123,9 @@ if ! systemctl restart "$CFWARP_SERVICE_NAME"; then
     echo "==> [CFwarp] 重启失败，将等待冷却期后再试。" >&2
     exit 1
 fi
-if ! "$SCRIPT_DIR/cfwarp-healthcheck.sh" --wait --format env > "$TMP_HEALTH" 2>&1; then
+if ! CFWARP_HEALTH_RETRIES="$CFWARP_WATCHDOG_RETRIES" \
+     CFWARP_HEALTH_RETRY_DELAY_SECONDS="$CFWARP_WATCHDOG_RETRY_DELAY_SECONDS" \
+     "$SCRIPT_DIR/cfwarp-healthcheck.sh" --wait --format env > "$TMP_HEALTH" 2>&1; then
     echo "==> [CFwarp] 重启后健康检查仍失败：" >&2
     cat "$TMP_HEALTH" >&2
     exit 1

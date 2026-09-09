@@ -7,19 +7,22 @@ StartLimitBurst=3
 
 [Service]
 Type=simple
-EnvironmentFile=-@ENV_FILE@
+Environment=CFWARP_ENV_FILE=@ENV_FILE@
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:@BIN_DIR@
 WorkingDirectory=@INSTALL_PREFIX@
 ExecStart=/bin/sh @INSTALL_PREFIX@/cfwarp-start.sh
 ExecStartPost=/bin/sh @INSTALL_PREFIX@/cfwarp-healthcheck.sh --wait
 ExecStopPost=/bin/sh @INSTALL_PREFIX@/cfwarp-stop.sh
 Restart=on-failure
+SuccessExitStatus=129 130 143
 RestartSec=30s
 TimeoutStartSec=180
 TimeoutStopSec=30s
 UMask=0077
-PrivateTmp=true
-ProtectHome=read-only
+# Named namespace mounts must remain visible to other service commands and
+# host-side cfwarp-exec. PrivateTmp creates a separate mount namespace.
+PrivateTmp=false
+ProtectHome=false
 NoNewPrivileges=true
 LockPersonality=true
 RestrictRealtime=true

@@ -1,0 +1,64 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_PATH=$0
+while [ -L "$SCRIPT_PATH" ]; do
+    SCRIPT_LINK=$(readlink "$SCRIPT_PATH")
+    case "$SCRIPT_LINK" in
+        /*) SCRIPT_PATH=$SCRIPT_LINK ;;
+        *) SCRIPT_PATH="$(dirname "$SCRIPT_PATH")/$SCRIPT_LINK" ;;
+    esac
+done
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname "$SCRIPT_PATH")" && pwd)
+if [ ! -r "$SCRIPT_DIR/lib/cfwarp-common.sh" ]; then
+    SCRIPT_DIR=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)
+fi
+# shellcheck source=lib/cfwarp-common.sh
+. "$SCRIPT_DIR/lib/cfwarp-common.sh"
+
+usage() {
+    cat <<'EOF'
+CFwarp: Linux WARP egress for selected applications / Linux 按应用 WARP 出站代理
+Usage / 用法: cfwarp <command> [arguments]
+  start | stop | restart | status   Manage the systemd service / 管理服务
+  logs [-f] [-n NUMBER]             View logs / 查看日志
+  health [--wait] [--format env]    Check SOCKS5 and WARP / 健康检查
+  doctor [--fix]                   Inspect installation / 安装自检
+  refresh                          Evaluate configured endpoints / 评估端点
+  exec COMMAND [ARGUMENTS...]       Run in WARP namespace (root) / 命名空间执行
+  env                              Show config path (no secrets) / 配置文件路径
+  help                             Show this help / 帮助
+EOF
+}
+COMMAND=${1:-help}
+[ "$#" -eq 0 ] || shift
+case "$COMMAND" in help|-h|--help) usage; exit 0 ;; esac
+cfwarp_load_env "$SCRIPT_DIR"
+CFWARP_SERVICE_NAME=${CFWARP_SERVICE_NAME:-cfwarp.service}
+case "$COMMAND" in
+    start|stop|restart|status)
+        [ "$#" -eq 0 ] || { usage >&2; exit 2; }
+        exec systemctl "$COMMAND" "$CFWARP_SERVICE_NAME" ;;
+    logs)
+        LINES=50
+        FOLLOW=0
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                -f|--follow) FOLLOW=1; shift ;;
+                -n|--lines)
+                    [ "$#" -ge 2 ] || { echo '-n requires a number' >&2; exit 2; }
+                    cfwarp_validate_uint "$2" lines 1 100000 || exit 2
+                    LINES=$2; shift 2 ;;
+                *) echo "Unknown logs option: $1" >&2; exit 2 ;;
+            esac
+        done
+        set -- journalctl -u "$CFWARP_SERVICE_NAME" -n "$LINES" --no-pager
+        [ "$FOLLOW" = 0 ] || set -- "$@" -f
+        exec "$@" ;;
+    health|test) exec sh "$SCRIPT_DIR/cfwarp-healthcheck.sh" "$@" ;;
+    doctor) exec sh "$SCRIPT_DIR/cfwarp-doctor.sh" "$@" ;;
+    refresh) [ "$#" -eq 0 ] || exit 2; exec sh "$SCRIPT_DIR/cfwarp-refresh-endpoint.sh" ;;
+    exec) exec sh "$SCRIPT_DIR/cfwarp-exec" "$@" ;;
+    env) printf '%s\n' "$CFWARP_ENV_FILE" ;;
+    *) echo "Unknown command: $COMMAND" >&2; usage >&2; exit 2 ;;
+esac

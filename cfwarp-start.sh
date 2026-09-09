@@ -9,6 +9,7 @@ if [ ! -r "$COMMON_FILE" ]; then
 fi
 # shellcheck disable=SC1090
 . "$COMMON_FILE"
+cfwarp_load_env "$SCRIPT_DIR"
 
 CFWARP_MODE=${CFWARP_MODE:-netns-proxy}
 WG_INTERFACE=${WG_INTERFACE:-wg0}
@@ -18,6 +19,15 @@ WG_CONF=${WG_CONF:-${WG_CONF_DIR}/${WG_INTERFACE}.conf}
 WGCF_PROFILE=${WGCF_PROFILE:-${CFWARP_DATA_DIR}/wgcf-profile.conf}
 WGCF_ACCOUNT=${WGCF_ACCOUNT:-${CFWARP_DATA_DIR}/wgcf-account.toml}
 WG_QUICK_BIN=${WG_QUICK_BIN:-${SCRIPT_DIR}/bin/wg-quick}
+cfwarp_validate_link_name "$WG_INTERFACE" WG_INTERFACE
+case "$WG_CONF" in
+    /*) ;;
+    *) echo '==> [ERROR] WG_CONF 必须为绝对路径。' >&2; exit 1 ;;
+esac
+[ "$(basename "$WG_CONF")" = "${WG_INTERFACE}.conf" ] || {
+    echo '==> [ERROR] WG_CONF 文件名必须与 WG_INTERFACE 一致。' >&2
+    exit 1
+}
 CFWARP_TEST_MODE=${CFWARP_TEST_MODE:-0}
 
 if [ "$CFWARP_TEST_MODE" = "1" ]; then
@@ -30,9 +40,8 @@ case "$CFWARP_MODE" in
 esac
 
 if [ "$CFWARP_MODE" = "host-global" ]; then
-    # The host-global mode intentionally leaves routing decisions to the
-    # supplied wg-quick config. Stop any old interface before rebuilding it.
-    "$WG_QUICK_BIN" down "$WG_INTERFACE" >/dev/null 2>&1 || true
+    # Entrypoint holds the host interface lock and verifies ownership before
+    # replacing a tunnel. Never pre-delete an interface by its name here.
     exec sh "${SCRIPT_DIR}/entrypoint.sh"
 fi
 
@@ -41,22 +50,45 @@ NETNS_PEER_ADDR=${NETNS_PEER_ADDR:-169.254.240.2/30}
 PROXY_CONNECT_HOST=${NETNS_PEER_HOST:-$(printf '%s\n' "$NETNS_PEER_ADDR" | cut -d/ -f1)}
 export PROXY_CONNECT_HOST
 
-sh "${SCRIPT_DIR}/cfwarp-netns.sh" up
-CFWARP_NETNS_CLEANED=0
+command -v setsid >/dev/null 2>&1 || {
+    echo '==> [ERROR] 缺少 setsid 命令 (util-linux)。' >&2
+    exit 1
+}
+CFWARP_CHILD_PID=
 cleanup_netns() {
     CFWARP_EXIT_STATUS=$?
-    if [ "$CFWARP_NETNS_CLEANED" = "0" ]; then
-        sh "${SCRIPT_DIR}/cfwarp-netns.sh" down >/dev/null 2>&1 || true
-        CFWARP_NETNS_CLEANED=1
+    trap - EXIT
+    trap '' HUP INT TERM
+    if [ -n "$CFWARP_CHILD_PID" ]; then
+        kill -TERM "$CFWARP_CHILD_PID" 2>/dev/null || true
+        CFWARP_CHILD_WAIT=0
+        while kill -0 "$CFWARP_CHILD_PID" 2>/dev/null && [ "$CFWARP_CHILD_WAIT" -lt 100 ]; do
+            sleep 0.1
+            CFWARP_CHILD_WAIT=$((CFWARP_CHILD_WAIT + 1))
+        done
+        # Every phase has an isolated group; remove any descendant left after
+        # graceful shutdown, including a command that ignores TERM.
+        kill -KILL "-$CFWARP_CHILD_PID" 2>/dev/null || true
+        wait "$CFWARP_CHILD_PID" 2>/dev/null || true
+        CFWARP_CHILD_PID=
+    fi
+    if ! sh "${SCRIPT_DIR}/cfwarp-netns.sh" down; then
+        CFWARP_EXIT_STATUS=1
     fi
     exit "$CFWARP_EXIT_STATUS"
 }
-trap 'cleanup_netns' EXIT
-trap 'exit 143' HUP INT TERM
+# Install supervision before setup: a stop during setup must wait for its
+# rollback before attempting another namespace operation.
+trap cleanup_netns EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+setsid sh "${SCRIPT_DIR}/cfwarp-netns.sh" up &
+CFWARP_CHILD_PID=$!
+wait "$CFWARP_CHILD_PID"
+CFWARP_CHILD_PID=
 
-# The environment is inherited from systemd/its EnvironmentFile. Only the
-# namespace-local helper variable must be added here.
-ip netns exec "$NETNS_NAME" env \
+setsid ip netns exec "$NETNS_NAME" env \
     CFWARP_MODE="$CFWARP_MODE" \
     PROXY_CONNECT_HOST="$PROXY_CONNECT_HOST" \
     WG_INTERFACE="$WG_INTERFACE" \
@@ -66,4 +98,7 @@ ip netns exec "$NETNS_NAME" env \
     WGCF_PROFILE="$WGCF_PROFILE" \
     WGCF_ACCOUNT="$WGCF_ACCOUNT" \
     WG_QUICK_BIN="$WG_QUICK_BIN" \
-    sh "${SCRIPT_DIR}/entrypoint.sh"
+    sh "${SCRIPT_DIR}/entrypoint.sh" &
+CFWARP_CHILD_PID=$!
+wait "$CFWARP_CHILD_PID"
+CFWARP_CHILD_PID=

@@ -4,13 +4,13 @@ After=cfwarp.service
 
 [Service]
 Type=oneshot
-EnvironmentFile=-@ENV_FILE@
+Environment=CFWARP_ENV_FILE=@ENV_FILE@
 WorkingDirectory=@INSTALL_PREFIX@
 ExecStart=/bin/sh @INSTALL_PREFIX@/cfwarp-watchdog.sh
 TimeoutStartSec=6min
 UMask=0077
-PrivateTmp=true
-ProtectHome=read-only
+PrivateTmp=false
+ProtectHome=false
 NoNewPrivileges=true
 LockPersonality=true
 RestrictRealtime=true

@@ -10,6 +10,7 @@ if [ ! -r "$COMMON_FILE" ]; then
 fi
 # shellcheck disable=SC1090
 . "$COMMON_FILE"
+cfwarp_load_env "$SCRIPT_DIR" || exit 1
 
 WG_INTERFACE=${WG_INTERFACE:-wg0}
 CFWARP_DATA_DIR=${CFWARP_DATA_DIR:-${SCRIPT_DIR}/var}
@@ -62,6 +63,9 @@ require_command mktemp
 
 umask 077
 
+cfwarp_validate_link_name "$WG_INTERFACE" WG_INTERFACE || exit 1
+case "$WG_CONF" in /*) ;; *) echo "==> [ERROR] WG_CONF 必须为绝对路径。" >&2; exit 1 ;; esac
+[ "$(basename "$WG_CONF")" = "${WG_INTERFACE}.conf" ] || { echo "==> [ERROR] WG_CONF 文件名必须与 WG_INTERFACE 一致。" >&2; exit 1; }
 cfwarp_validate_uint "$WARP_MTU" WARP_MTU 576 9000 || exit 1
 cfwarp_validate_uint "$WARP_PERSISTENT_KEEPALIVE" WARP_PERSISTENT_KEEPALIVE 0 65535 || exit 1
 cfwarp_validate_uint "$WARP_READY_ATTEMPTS" WARP_READY_ATTEMPTS 1 100 || exit 1
@@ -163,11 +167,11 @@ initialize_wgcf() {
         return 1
     fi
     require_command sha256sum
-    require_command git
 
     CFWARP_WGCF_TMP=$(mktemp -d)
     cleanup_wgcf_tmp() { rm -rf "$CFWARP_WGCF_TMP"; }
-    trap 'cleanup_wgcf_tmp' EXIT HUP INT TERM
+    trap 'cleanup_wgcf_tmp' EXIT
+    trap 'exit 143' HUP INT TERM
     echo "==> [CFwarp] 正在下载并校验固定版本 wgcf。"
     curl -fL --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 90 \
         -o "${CFWARP_WGCF_TMP}/wgcf" "$(build_wgcf_download_url "$WGCF_VERSION" "$CFWARP_WGCF_ARCH")"
@@ -175,15 +179,26 @@ initialize_wgcf() {
         printf '%s  %s\n' "$EFFECTIVE_WGCF_SHA256" "${CFWARP_WGCF_TMP}/wgcf" | sha256sum -c -
     fi
     chmod 0700 "${CFWARP_WGCF_TMP}/wgcf"
+    CFWARP_ACCOUNT_REUSED=0
+    if [ -e "$WGCF_ACCOUNT" ]; then
+        # An existing account owns the WARP identity. Rebuild its profile;
+        # never register a replacement merely because a generated file is gone.
+        cp "$WGCF_ACCOUNT" "${CFWARP_WGCF_TMP}/wgcf-account.toml"
+        CFWARP_ACCOUNT_REUSED=1
+    fi
     (
         cd "$CFWARP_WGCF_TMP"
-        ./wgcf register --accept-tos >/dev/null
+        if [ "$CFWARP_ACCOUNT_REUSED" != "1" ]; then
+            ./wgcf register --accept-tos >/dev/null
+        fi
         ./wgcf generate >/dev/null
     )
     [ -f "${CFWARP_WGCF_TMP}/wgcf-profile.conf" ] || { echo "==> [ERROR] wgcf 未生成 profile。" >&2; return 1; }
     [ -f "${CFWARP_WGCF_TMP}/wgcf-account.toml" ] || { echo "==> [ERROR] wgcf 未生成 account。" >&2; return 1; }
+    if [ "$CFWARP_ACCOUNT_REUSED" != "1" ]; then
+        install -m 0600 "${CFWARP_WGCF_TMP}/wgcf-account.toml" "$WGCF_ACCOUNT"
+    fi
     install -m 0600 "${CFWARP_WGCF_TMP}/wgcf-profile.conf" "$WGCF_PROFILE"
-    install -m 0600 "${CFWARP_WGCF_TMP}/wgcf-account.toml" "$WGCF_ACCOUNT"
     sync_wg_conf_from_profile
     trap - EXIT HUP INT TERM
     cleanup_wgcf_tmp
@@ -332,68 +347,158 @@ wait_for_warp_ready() {
 set_runtime_endpoint() {
     CFWARP_NEW_ENDPOINT=$1
     CFWARP_PEER_KEY=$2
-    CFWARP_OLD_ENDPOINT=$(current_runtime_endpoint || true)
-    [ -n "$CFWARP_NEW_ENDPOINT" ] || return 1
-    [ -n "$CFWARP_PEER_KEY" ] || return 1
+    [ -n "$CFWARP_NEW_ENDPOINT" ] && [ -n "$CFWARP_PEER_KEY" ] || return 1
     cfwarp_validate_endpoint "$CFWARP_NEW_ENDPOINT" || return 1
-    wg set "$WG_INTERFACE" peer "$CFWARP_PEER_KEY" endpoint "$CFWARP_NEW_ENDPOINT" >/dev/null 2>&1 || return 1
-    if ! write_endpoint_to_config "$CFWARP_NEW_ENDPOINT"; then
-        if [ -n "$CFWARP_OLD_ENDPOINT" ]; then
-            wg set "$WG_INTERFACE" peer "$CFWARP_PEER_KEY" endpoint "$CFWARP_OLD_ENDPOINT" >/dev/null 2>&1 || true
-        fi
-        return 1
-    fi
+    wg set "$WG_INTERFACE" peer "$CFWARP_PEER_KEY" endpoint "$CFWARP_NEW_ENDPOINT"
+}
+
+# WireGuard resolves hostnames and canonicalizes IPv6. Compare the resulting
+# endpoint to the requested address (or one of its current DNS answers).
+canonical_ip() {
+    printf '%s\n' "$1" | awk '
+        index($0, ":") {
+            value = tolower($0); count = split(value, halves, "::")
+            left = split(halves[1], a, ":"); if (halves[1] == "") left = 0
+            right = 0; if (count == 2 && halves[2] != "") right = split(halves[2], b, ":")
+            result = ""
+            for (i = 1; i <= left; i++) { sub(/^0+/, "", a[i]); result = result (a[i] == "" ? "0" : a[i]) ":" }
+            if (count == 2) for (i = 0; i < 8 - left - right; i++) result = result "0:"
+            for (i = 1; i <= right; i++) { sub(/^0+/, "", b[i]); result = result (b[i] == "" ? "0" : b[i]) ":" }
+            print result; next
+        }
+        { print }
+    '
+}
+
+runtime_endpoint_matches() {
+    CFWARP_EXPECTED=$1
+    CFWARP_OBSERVED=$(current_runtime_endpoint || true)
+    [ -n "$CFWARP_OBSERVED" ] || return 1
+    awk -v expected="${CFWARP_EXPECTED##*:}" -v observed="${CFWARP_OBSERVED##*:}" 'BEGIN { exit expected + 0 == observed + 0 ? 0 : 1 }' || return 1
+    CFWARP_EXPECTED_HOST=${CFWARP_EXPECTED%:*}
+    CFWARP_OBSERVED_HOST=${CFWARP_OBSERVED%:*}
+    CFWARP_EXPECTED_HOST=${CFWARP_EXPECTED_HOST#\[}; CFWARP_EXPECTED_HOST=${CFWARP_EXPECTED_HOST%\]}
+    CFWARP_OBSERVED_HOST=${CFWARP_OBSERVED_HOST#\[}; CFWARP_OBSERVED_HOST=${CFWARP_OBSERVED_HOST%\]}
+    [ "$(canonical_ip "$CFWARP_EXPECTED_HOST")" = "$(canonical_ip "$CFWARP_OBSERVED_HOST")" ] && return 0
+    case "$CFWARP_EXPECTED_HOST" in *:*) return 1 ;; esac
+    command -v getent >/dev/null 2>&1 || return 1
+    CFWARP_RESOLVED=$(getent ahosts "$CFWARP_EXPECTED_HOST" 2>/dev/null | awk '{ print $1 }' | sort -u)
+    for CFWARP_RESOLVED_IP in $CFWARP_RESOLVED; do
+        [ "$(canonical_ip "$CFWARP_RESOLVED_IP")" = "$(canonical_ip "$CFWARP_OBSERVED_HOST")" ] && return 0
+    done
+    return 1
 }
 
 build_candidate_endpoints() {
     CFWARP_CURRENT_ENDPOINT=$1
     (
-        [ -n "$CFWARP_CURRENT_ENDPOINT" ] && printf '%s\n' "$CFWARP_CURRENT_ENDPOINT"
         [ -n "$ENDPOINT_IP" ] && printf '%s\n' "$ENDPOINT_IP"
+        [ "$CFWARP_PROBE_MODE" = "1" ] && exit 0
+        [ -n "$CFWARP_CURRENT_ENDPOINT" ] && printf '%s\n' "$CFWARP_CURRENT_ENDPOINT"
         printf '%s\n' "$ENDPOINT_CANDIDATES" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
     ) | awk 'NF && !seen[$0]++'
 }
 
+# The host lock must precede even the backup: a waiting controller must never
+# restore a snapshot taken before another owner finished updating this config.
+CFWARP_HOST_GUARD=0
+if [ "${CFWARP_MODE:-netns-proxy}" = "host-global" ] && [ "$CFWARP_PROBE_MODE" != "1" ]; then
+    CFWARP_HOST_GUARD=1
+    cfwarp_host_guard_prepare
+fi
+
 umask 077
 mkdir -p "$CFWARP_DATA_DIR" "$(dirname "$WG_CONF")"
-if [ -f "$WGCF_PROFILE" ]; then
-    sync_wg_conf_from_profile
-elif [ ! -f "$WG_CONF" ]; then
-    migrate_legacy_wg_conf
+if [ ! -f "$WG_CONF" ]; then
+    if [ -f "$WGCF_PROFILE" ]; then
+        sync_wg_conf_from_profile
+    else
+        migrate_legacy_wg_conf
+    fi
 fi
 if [ ! -f "$WG_CONF" ]; then
     echo "==> [CFwarp] 未检测到配置，正在初始化 Cloudflare WARP。"
     initialize_wgcf
 fi
 [ -f "$WG_CONF" ] || { echo "==> [ERROR] 缺少 WireGuard 配置: $WG_CONF" >&2; exit 1; }
-prepare_wireguard_config
 if [ -n "$ENDPOINT_IP" ]; then
     cfwarp_validate_endpoint "$ENDPOINT_IP" || { echo "==> [ERROR] ENDPOINT_IP 格式非法。" >&2; exit 1; }
 fi
 
-WG_UP=0
-CFWARP_TMP_CANDIDATES=$(mktemp)
-cleanup_entrypoint() {
-    CFWARP_EXIT_STATUS=$?
-    rm -f "$CFWARP_TMP_CANDIDATES"
-    if [ "$WG_UP" = "1" ]; then
-        "$WG_QUICK_BIN" down "$WG_INTERFACE" >/dev/null 2>&1 || true
-        WG_UP=0
-    fi
-    exit "$CFWARP_EXIT_STATUS"
-}
-trap 'cleanup_entrypoint' EXIT
-
-"$WG_QUICK_BIN" down "$WG_INTERFACE" >/dev/null 2>&1 || true
-echo "==> [CFwarp] 正在启动 WireGuard WARP 隧道。"
-WG_UP=1
-if ! "$WG_QUICK_BIN" up "$WG_CONF" >/dev/null 2>&1; then
+if [ "$CFWARP_PROBE_MODE" = "1" ] && [ -z "$ENDPOINT_IP" ]; then
+    echo "==> [ERROR] 探测模式必须显式指定 ENDPOINT_IP。" >&2
     exit 1
 fi
 
-INITIAL_ENDPOINT=$(current_runtime_endpoint || true)
+WG_UP=0
+PROXY_PID=
+CFWARP_CONFIG_COMMITTED=0
+CFWARP_TMP_ORIGINAL_CONF=$(mktemp "${WG_CONF}.before.XXXXXX")
+if ! cp "$WG_CONF" "$CFWARP_TMP_ORIGINAL_CONF"; then
+    rm -f "$CFWARP_TMP_ORIGINAL_CONF"
+    exit 1
+fi
+CFWARP_TMP_CANDIDATES=
+INITIAL_ENDPOINT=$(config_endpoint)
+cleanup_entrypoint() {
+    CFWARP_EXIT_STATUS=$?
+    trap - EXIT HUP INT TERM
+    if [ -n "$PROXY_PID" ]; then
+        kill "$PROXY_PID" 2>/dev/null || true
+        CFWARP_PROXY_WAIT=0
+        while kill -0 "$PROXY_PID" 2>/dev/null && [ "$CFWARP_PROXY_WAIT" -lt 5 ]; do
+            sleep 1
+            CFWARP_PROXY_WAIT=$((CFWARP_PROXY_WAIT + 1))
+        done
+        kill -KILL "$PROXY_PID" 2>/dev/null || true
+        wait "$PROXY_PID" 2>/dev/null || true
+    fi
+    rm -f "$CFWARP_TMP_CANDIDATES"
+    if [ "$WG_UP" = "1" ]; then
+        if [ "$CFWARP_HOST_GUARD" = "1" ]; then
+            cfwarp_host_guard_cleanup || CFWARP_EXIT_STATUS=1
+        elif ! "$WG_QUICK_BIN" down "$WG_CONF"; then
+            if ip link show dev "$WG_INTERFACE" >/dev/null 2>&1; then
+                echo "==> [ERROR] WireGuard 接口清理失败: $WG_INTERFACE" >&2
+                CFWARP_EXIT_STATUS=1
+            fi
+        fi
+        WG_UP=0
+    fi
+    if [ "$CFWARP_CONFIG_COMMITTED" != "1" ]; then
+        if ! cat "$CFWARP_TMP_ORIGINAL_CONF" | cfwarp_atomic_write_from_stdin "$WG_CONF"; then
+            echo "==> [ERROR] 无法恢复原 WireGuard 配置，备份保留在 $CFWARP_TMP_ORIGINAL_CONF" >&2
+            exit 1
+        fi
+    fi
+    rm -f "$CFWARP_TMP_ORIGINAL_CONF"
+    exit "$CFWARP_EXIT_STATUS"
+}
+trap 'cleanup_entrypoint' EXIT
+trap 'exit 143' HUP INT TERM
+
+CFWARP_TMP_CANDIDATES=$(mktemp)
+prepare_wireguard_config
+# wg-quick resolves Endpoint during up. Apply the explicit choice before that
+# point so a stale hostname from an old profile cannot prevent startup.
+if [ -n "$ENDPOINT_IP" ]; then
+    write_endpoint_to_config "$ENDPOINT_IP"
+fi
+if [ "$CFWARP_HOST_GUARD" != "1" ]; then
+    "$WG_QUICK_BIN" down "$WG_CONF" >/dev/null 2>&1 || true
+fi
+echo "==> [CFwarp] 正在启动 WireGuard WARP 隧道。"
+WG_UP=1
+if ! "$WG_QUICK_BIN" up "$WG_CONF"; then
+    echo "==> [ERROR] 无法启动 WireGuard 配置: $WG_CONF" >&2
+    exit 1
+fi
+
+if [ "$CFWARP_HOST_GUARD" = "1" ]; then
+    cfwarp_host_guard_record
+fi
 if [ -z "$INITIAL_ENDPOINT" ]; then
-    INITIAL_ENDPOINT=$(config_endpoint)
+    INITIAL_ENDPOINT=$(current_runtime_endpoint || true)
 fi
 PEER_KEY=$(peer_public_key || true)
 WARP_READY=0
@@ -416,7 +521,8 @@ while IFS= read -r CFWARP_CANDIDATE_ENDPOINT; do
         fi
     fi
     echo "==> [CFwarp] 正在检查 WARP 隧道可用性。"
-    if TRACE_OUTPUT=$(wait_for_warp_ready); then
+    if TRACE_OUTPUT=$(wait_for_warp_ready) && runtime_endpoint_matches "$CFWARP_CANDIDATE_ENDPOINT"; then
+        SELECTED_ENDPOINT=$CFWARP_CANDIDATE_ENDPOINT
         WARP_READY=1
         READY_COMPLETED_AT=$(date +%s)
         break
@@ -424,10 +530,6 @@ while IFS= read -r CFWARP_CANDIDATE_ENDPOINT; do
 done < "$CFWARP_TMP_CANDIDATES"
 
 if [ "$WARP_READY" != "1" ]; then
-    if [ -n "$INITIAL_ENDPOINT" ] && [ -n "$PEER_KEY" ]; then
-        wg set "$WG_INTERFACE" peer "$PEER_KEY" endpoint "$INITIAL_ENDPOINT" >/dev/null 2>&1 || true
-        write_endpoint_to_config "$INITIAL_ENDPOINT" >/dev/null 2>&1 || true
-    fi
     echo "==> [ERROR] WARP 隧道未就绪，请检查 Endpoint、UDP 出口和系统日志。" >&2
     exit 1
 fi
@@ -442,11 +544,16 @@ if [ "$CFWARP_PROBE_MODE" = "1" ]; then
     READY_SECONDS=$((READY_COMPLETED_AT - READY_STARTED_AT))
     HTTP_AVG_TOTAL=$(measure_probe_http_average) || { echo "==> [ERROR] Endpoint 探测延迟测量失败。" >&2; exit 1; }
     SCORE=$(awk -v ready="$READY_SECONDS" -v total="$HTTP_AVG_TOTAL" 'BEGIN { printf "%.6f\n", ready + total }')
-    SELECTED_ENDPOINT=$(current_runtime_endpoint || true)
+    if ! runtime_endpoint_matches "$SELECTED_ENDPOINT"; then
+        echo "==> [ERROR] 探测结束时的实际 Endpoint 与候选不一致。" >&2
+        exit 1
+    fi
+    RUNTIME_ENDPOINT=$(current_runtime_endpoint)
     if [ -n "$CFWARP_PROBE_METRICS_FILE" ]; then
         umask 077
         {
             printf 'SELECTED_ENDPOINT=%s\n' "$SELECTED_ENDPOINT"
+            printf 'RUNTIME_ENDPOINT=%s\n' "$RUNTIME_ENDPOINT"
             printf 'READY_SECONDS=%s\n' "$READY_SECONDS"
             printf 'HTTP_AVG_TOTAL=%s\n' "$HTTP_AVG_TOTAL"
             printf 'SCORE=%s\n' "$SCORE"
@@ -456,6 +563,8 @@ if [ "$CFWARP_PROBE_MODE" = "1" ]; then
     echo "==> [CFwarp] Endpoint 探测完成: endpoint=${SELECTED_ENDPOINT} ready=${READY_SECONDS}s avg=${HTTP_AVG_TOTAL}s score=${SCORE}"
     exit 0
 fi
+
+write_endpoint_to_config "$SELECTED_ENDPOINT" || { echo "==> [ERROR] 无法保存已验证的 Endpoint。" >&2; exit 1; }
 
 LISTEN_ADDR=${BIND_ADDR:-${PROXY_CONNECT_HOST:-127.0.0.1}}
 LISTEN_PORT=${BIND_PORT:-1080}
@@ -494,8 +603,13 @@ else
     echo "==> [CFwarp] SOCKS5 未启用认证；请确保监听地址仅对受控网络可达。"
 fi
 echo "==> [CFwarp] SOCKS5 正在监听 ${LISTEN_ADDR}:${LISTEN_PORT}。"
+CFWARP_CONFIG_COMMITTED=1
+"$@" &
+PROXY_PID=$!
 set +e
-"$@"
+wait "$PROXY_PID"
 CFWARP_PROXY_STATUS=$?
+[ "$CFWARP_PROXY_STATUS" -eq 0 ] || CFWARP_CONFIG_COMMITTED=0
+PROXY_PID=
 set -e
 exit "$CFWARP_PROXY_STATUS"

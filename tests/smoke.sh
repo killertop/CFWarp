@@ -21,6 +21,7 @@ SCRIPTS="
     cfwarp-watchdog.sh
     cfwarp-doctor.sh
     cfwarp-exec
+    cmd/cfwarp
     install.sh
     lib/cfwarp-common.sh
 "
@@ -52,7 +53,7 @@ fi
 cp "$ROOT/deploy/cfwarp.env.example" "$TMP_DIR/env"
 chmod 0600 "$TMP_DIR/env"
 cfwarp_set_env_key CFWARP_DATA_DIR /tmp/cfwarp-smoke-data "$TMP_DIR/env"
-grep -Fx 'CFWARP_DATA_DIR=/tmp/cfwarp-smoke-data' "$TMP_DIR/env" >/dev/null
+[ "$(cfwarp_read_env_key CFWARP_DATA_DIR "$TMP_DIR/env")" = /tmp/cfwarp-smoke-data ]
 
 if git -C "$ROOT" diff --check; then
     :
@@ -70,14 +71,19 @@ PRIVATE_FEATURE=CFWARP_
 PRIVATE_FEATURE="${PRIVATE_FEATURE}OPENAI"
 PRIVATE_PATH=/opt
 PRIVATE_PATH="${PRIVATE_PATH}/web/CFwarp"
-if rg -n --hidden --glob '!.git/**' \
+command -v rg >/dev/null 2>&1 || fail 'ripgrep is required for the source scan'
+SCAN_STATUS=0
+rg -n --hidden --glob '!.git/**' \
     -e "$PRIVATE_WORD" \
     -e "$PRIVATE_IP" \
     -e "$PRIVATE_KEY_PREFIX" \
     -e "$PRIVATE_FEATURE" \
     -e "$PRIVATE_PATH" \
-    "$ROOT" >/dev/null 2>&1; then
-    fail 'private or server-specific material found'
-fi
+    "$ROOT" >/dev/null || SCAN_STATUS=$?
+case "$SCAN_STATUS" in
+    0) fail 'private or server-specific material found' ;;
+    1) ;;
+    *) fail "source scan failed (status $SCAN_STATUS)" ;;
+esac
 
 echo 'CFwarp smoke tests passed'

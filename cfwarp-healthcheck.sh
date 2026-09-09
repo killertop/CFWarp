@@ -10,7 +10,7 @@ fi
 # shellcheck disable=SC1090
 . "$COMMON_FILE"
 
-CFWARP_ENV_FILE=$(cfwarp_default_env_file "$SCRIPT_DIR")
+cfwarp_load_env "$SCRIPT_DIR" || exit 1
 WAIT_MODE=0
 OUTPUT_FORMAT=text
 CLI_METRICS_FILE=
@@ -23,7 +23,7 @@ while [ $# -gt 0 ]; do
             ;;
         --format|--env)
             if [ "$1" = "--env" ]; then
-                OUTPUT_FORMAT=env
+                OUTPUT_FORMAT="env"
                 shift
                 continue
             fi
@@ -61,15 +61,6 @@ EOF
             ;;
     esac
 done
-
-if [ -r "$CFWARP_ENV_FILE" ]; then
-    set -a
-    # shellcheck disable=SC1090
-    . "$CFWARP_ENV_FILE"
-    set +a
-elif [ -f "$CFWARP_ENV_FILE" ]; then
-    echo "==> [CFwarp] 环境文件不可读，将使用默认代理参数: $CFWARP_ENV_FILE" >&2
-fi
 
 CFWARP_MODE=${CFWARP_MODE:-netns-proxy}
 NETNS_NAME=${NETNS_NAME:-cfwarp}
@@ -201,11 +192,15 @@ check_once() {
         return 1
     fi
 
-    eval "$(printf '%s\n' "$TRACE_OUTPUT" | awk -F= '
-        $1 == "ip" && !ip_seen { printf "EXIT_IP='\''%s'\'';\n", $2; ip_seen=1 }
-        $1 == "colo" && !colo_seen { printf "COLO='\''%s'\'';\n", $2; colo_seen=1 }
-        $1 == "warp" && !warp_seen { printf "WARP_STATE='\''%s'\'';\n", $2; warp_seen=1 }
-    ')"
+    # Trace is untrusted network data. Extract values as data, never shell code.
+    EXIT_IP=$(printf '%s\n' "$TRACE_OUTPUT" | awk -F= '$1 == "ip" && $2 ~ /^[0-9A-Fa-f:.]+$/ { print $2; exit }')
+    COLO=$(printf '%s\n' "$TRACE_OUTPUT" | awk -F= '$1 == "colo" && $2 ~ /^[A-Za-z0-9_-]+$/ { print $2; exit }')
+    WARP_STATE=$(printf '%s\n' "$TRACE_OUTPUT" | awk -F= '$1 == "warp" && ($2 == "on" || $2 == "plus") { print $2; exit }')
+    if ! printf '%s\n' "$TIME_TOTAL" | awk '/^[0-9]+([.][0-9]+)?$/ { valid = 1 } END { exit NR == 1 && valid ? 0 : 1 }'; then
+        echo "==> [ERROR] 健康检查耗时数据非法。" >&2
+        write_failure_metrics invalid_timing "$PROXY_HOST"
+        return 1
+    fi
     TOTAL_MS=$(awk -v total="${TIME_TOTAL:-0}" 'BEGIN { printf "%d", total * 1000 }')
     WARN_SLOW=0
     if awk -v total="${TIME_TOTAL:-0}" -v warn="$CFWARP_HEALTH_WARN_TOTAL_SECONDS" 'BEGIN { exit total > warn ? 0 : 1 }'; then
@@ -229,7 +224,7 @@ EOF
     else
         echo "==> [CFwarp] 健康检查通过: exit_ip=${EXIT_IP:-unknown} colo=${COLO:-unknown} warp=${WARP_STATE:-unknown} total_ms=${TOTAL_MS}"
     fi
-    printf '%s\n' "$METRICS_OUTPUT" | write_metrics_file || true
+    printf '%s\n' "$METRICS_OUTPUT" | write_metrics_file || { echo "==> [ERROR] 无法写入健康检查指标文件。" >&2; return 1; }
     if [ "$WARN_SLOW" = "1" ]; then
         echo "==> [CFwarp] 警告：健康检查耗时偏高 (${TIME_TOTAL}s > ${CFWARP_HEALTH_WARN_TOTAL_SECONDS}s)。" >&2
     fi

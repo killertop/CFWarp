@@ -10,7 +10,7 @@ fi
 # shellcheck disable=SC1090
 . "$COMMON_FILE"
 
-CFWARP_ENV_FILE=$(cfwarp_default_env_file "$SCRIPT_DIR")
+cfwarp_load_env "$SCRIPT_DIR" || exit 1
 CFWARP_SERVICE_NAME=${CFWARP_SERVICE_NAME:-cfwarp.service}
 CFWARP_DATA_DIR=${CFWARP_DATA_DIR:-/var/lib/cfwarp}
 CFWARP_MODE=${CFWARP_MODE:-netns-proxy}
@@ -41,7 +41,7 @@ while [ $# -gt 0 ]; do
             cat <<EOF
 用法: $0 [--fix] [--metrics-file PATH]
 
-默认只检查；--fix 只修复文件权限、运行目录和陈旧状态锁，不会修改 sing-box、路由策略或防火墙规则。
+默认只检查；--fix 只修复脚本/环境/数据目录权限及创建缺失的数据目录。
 EOF
             exit 0
             ;;
@@ -61,12 +61,6 @@ fixed() { FIXES=$((FIXES + 1)); printf '%s\n' "fix: $*"; }
 
 load_env() {
     if [ -r "$CFWARP_ENV_FILE" ]; then
-        set -a
-        # shellcheck disable=SC1090
-        . "$CFWARP_ENV_FILE"
-        set +a
-        CFWARP_MODE=${CFWARP_MODE:-netns-proxy}
-        CFWARP_DATA_DIR=${CFWARP_DATA_DIR:-/var/lib/cfwarp}
         ok "已加载环境文件"
     elif [ -f "$CFWARP_ENV_FILE" ]; then
         warn "环境文件不可读，跳过依赖运行态配置的检查"
@@ -81,7 +75,7 @@ load_env() {
 }
 
 check_scripts() {
-    SCRIPT_LIST="lib/cfwarp-common.sh entrypoint.sh cfwarp-start.sh cfwarp-stop.sh cfwarp-netns.sh cfwarp-refresh-endpoint.sh cfwarp-healthcheck.sh cfwarp-watchdog.sh cfwarp-doctor.sh cfwarp-exec install.sh"
+    SCRIPT_LIST="lib/cfwarp-common.sh entrypoint.sh cfwarp-start.sh cfwarp-stop.sh cfwarp-netns.sh cfwarp-refresh-endpoint.sh cfwarp-healthcheck.sh cfwarp-watchdog.sh cfwarp-doctor.sh cfwarp-exec"
     for relative in $SCRIPT_LIST; do
         pathname="${SCRIPT_DIR}/${relative}"
         if [ ! -f "$pathname" ]; then
@@ -201,10 +195,8 @@ check_runtime() {
         fi
     fi
     if "$SCRIPT_DIR/cfwarp-healthcheck.sh" --format env > "$TMP_HEALTH" 2>&1; then
-        eval "$(awk -F= '
-            $1 == "CFWARP_EXIT_IP" && !ip_seen { printf "HEALTH_IP='\''%s'\'';\n", $2; ip_seen=1 }
-            $1 == "CFWARP_COLO" && !colo_seen { printf "HEALTH_COLO='\''%s'\'';\n", $2; colo_seen=1 }
-        ' "$TMP_HEALTH")"
+        HEALTH_IP=$(awk -F= '$1 == "CFWARP_EXIT_IP" { print $2; exit }' "$TMP_HEALTH")
+        HEALTH_COLO=$(awk -F= '$1 == "CFWARP_COLO" { print $2; exit }' "$TMP_HEALTH")
         ok "SOCKS/WARP 健康检查通过: exit_ip=${HEALTH_IP:-unknown} colo=${HEALTH_COLO:-unknown}"
     else
         cat "$TMP_HEALTH" >&2
@@ -244,7 +236,7 @@ main() {
         printf 'CFWARP_DOCTOR_WARNINGS=%s\n' "$WARNINGS"
         printf 'CFWARP_DOCTOR_FIXES=%s\n' "$FIXES"
         if [ -s "$TMP_HEALTH" ]; then sed -n '/^CFWARP_/p' "$TMP_HEALTH"; fi
-    } | write_metrics || true
+    } | write_metrics || fail "无法写入诊断指标文件"
     info "自检完成: failures=${FAILURES} warnings=${WARNINGS} fixes=${FIXES}"
     [ "$FAILURES" -eq 0 ]
 }
