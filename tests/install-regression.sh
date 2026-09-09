@@ -10,6 +10,8 @@ if systemctl cat cfwarp.service >/dev/null 2>&1; then
     echo 'Refusing installation test on a host with an existing cfwarp.service.' >&2
     exit 1
 fi
+# A removed test unit may still have a failed tombstone in the manager.
+systemctl reset-failed cfwarp.service >/dev/null 2>&1 || true
 ROOT_DIR=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
 TMP_DIR=$(mktemp -d /tmp/cfwarp-install-test.XXXXXX)
 cleanup() {
@@ -29,6 +31,7 @@ run_install() {
 }
 run_install > "$TMP_DIR/install.log" 2>&1 || { cat "$TMP_DIR/install.log"; exit 1; }
 test -x "$TMP_DIR/bin/wg-quick"
+cmp /usr/bin/wg-quick "$TMP_DIR/bin/wg-quick"
 test -L "$TMP_DIR/bin/cfwarp"
 test -L "$TMP_DIR/bin/cfwarp-exec"
 test "$("$TMP_DIR/bin/cfwarp" env)" = "$TMP_DIR/env/cfwarp.env"

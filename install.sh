@@ -28,7 +28,6 @@ RUN_DOCTOR_FIX=0
 FORCE_CLEAN=0
 SKIP_DEPS=0
 SKIP_BUILD=0
-SKIP_PATCH_WG_QUICK=0
 MICROSOCKS_REPO=${MICROSOCKS_REPO:-https://github.com/rofl0r/microsocks.git}
 MICROSOCKS_COMMIT=${MICROSOCKS_COMMIT:-98421a21c4adc4c77c0cf3a5d650cc28ad3e0107}
 MICROSOCKS_CFLAGS=${MICROSOCKS_CFLAGS:--O2 -pipe}
@@ -52,7 +51,7 @@ usage() {
   --bin-dir PATH              二进制目录，默认 <prefix>/bin
   --skip-deps                 跳过系统依赖安装
   --skip-build                跳过 microsocks 编译，要求目标目录已有可执行文件
-  --skip-patch-wg-quick       不移除 wg-quick 的 src_valid_mark 兼容行
+  --skip-patch-wg-quick       兼容旧命令；现在始终保留完整 wg-quick
   --doctor                    只运行自检
   --doctor-fix                只运行自检并修复权限/运行目录问题
   --no-enable                 不 enable cfwarp.service
@@ -104,7 +103,7 @@ while [ $# -gt 0 ]; do
             ;;
         --skip-deps) SKIP_DEPS=1; shift ;;
         --skip-build) SKIP_BUILD=1; shift ;;
-        --skip-patch-wg-quick) SKIP_PATCH_WG_QUICK=1; shift ;;
+        --skip-patch-wg-quick) shift ;;
         --doctor) RUN_DOCTOR=1; shift ;;
         --doctor-fix) RUN_DOCTOR=1; RUN_DOCTOR_FIX=1; shift ;;
         --no-enable) ENABLE_SERVICE=0; shift ;;
@@ -205,7 +204,14 @@ build_microsocks() {
 }
 
 install_private_wg_quick() {
-    WG_QUICK_SRC=${WG_QUICK_SRC:-$(command -v wg-quick 2>/dev/null || true)}
+    if [ -z "${WG_QUICK_SRC:-}" ]; then
+        # Prefer the package copy, not a previously patched private binary on PATH.
+        if [ -x /usr/bin/wg-quick ]; then
+            WG_QUICK_SRC=/usr/bin/wg-quick
+        else
+            WG_QUICK_SRC=$(command -v wg-quick 2>/dev/null || true)
+        fi
+    fi
     if [ -z "$WG_QUICK_SRC" ] || [ ! -f "$WG_QUICK_SRC" ]; then
         echo "==> [ERROR] 未找到 wg-quick，请先安装 wireguard-tools。" >&2
         exit 1
@@ -216,11 +222,8 @@ install_private_wg_quick() {
     else
         chmod 0755 "${BIN_DIR}/wg-quick"
     fi
-    if [ "$SKIP_PATCH_WG_QUICK" != "1" ] && grep -q 'src_valid_mark' "${BIN_DIR}/wg-quick"; then
-        # wg-quick tries to write a host sysctl while it is executed inside a
-        # namespace. Remove only that compatibility line from the private copy.
-        sed -i '/src_valid_mark/d' "${BIN_DIR}/wg-quick"
-    fi
+    # src_valid_mark is network-namespaced and needed with strict rp_filter.
+    # Preserve the complete distribution script, including its routing setup.
     if ! command -v bash >/dev/null 2>&1 || ! bash -n "${BIN_DIR}/wg-quick"; then
         echo "==> [ERROR] 私有 wg-quick 语法校验失败。" >&2
         exit 1
