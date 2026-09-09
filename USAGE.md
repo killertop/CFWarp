@@ -16,7 +16,7 @@ sudo editor /etc/cfwarp/cfwarp.env
 sudo systemctl enable --now cfwarp.service
 ```
 
-新安装默认准备文件并启用服务开机启动；添加 `--start` 可立即启动或重启。升级会恢复安装前正在运行的服务。首次启动在没有现有配置时调用 `wgcf register --accept-tos`，注册 WARP 账户并生成 WireGuard 配置。默认使用固定版本、带 SHA256 校验的 `wgcf`，MicroSOCKS 从固定 commit 构建。
+新安装默认准备文件并启用服务开机启动；添加 `--start` 可立即启动或重启。升级会恢复安装前正在运行的服务。缺少隧道配置时，优先复用现有 WARP 账户生成 WireGuard 配置；只有账户也不存在时，才调用 `wgcf register --accept-tos` 注册。默认使用固定版本、带 SHA256 校验的 `wgcf`，MicroSOCKS 从固定 commit 构建。
 
 默认路径为运行文件 `/opt/cfwarp`、环境文件 `/etc/cfwarp/cfwarp.env`、账户与隧道配置 `/var/lib/cfwarp`。可以自定义：
 
@@ -157,7 +157,7 @@ ENDPOINT_CANDIDATES=<host-or-ip>:<port>,<host-or-ip>:<port>
 CFWARP_ENDPOINT_REFRESH_ACTIVE_MODE=stop-and-probe
 ```
 
-探测复用同一 WireGuard 身份并串行运行，避免多个探测隧道相互影响。每个候选受超时控制，退出时终止探测再清理其资源。仅在达到改善阈值时写入新 Endpoint；恢复服务失败时尝试回滚原配置。测量只用于当时的候选比较，不证明长期带宽或稳定性。
+探测复用同一 WireGuard 身份并串行运行，避免多个探测隧道相互影响。每个候选受超时控制，退出时终止探测再清理其资源。当前 Endpoint 健康时，仅在达到改善阈值后切换；当前 Endpoint 不可用时，可以选择已验证可用的候选。恢复服务失败时尝试回滚原配置。测量只用于当时的候选比较，不证明长期带宽或稳定性。
 
 手动触发与查看日志：
 
@@ -201,7 +201,7 @@ sudo editor /etc/cfwarp/cfwarp.env
 sudo systemctl enable --now cfwarp.service
 ```
 
-A new installation prepares files and enables startup at boot; add `--start` to start or restart immediately. An upgrade restores a service that was running before installation. If no existing configuration is available, first startup runs `wgcf register --accept-tos` to register a WARP account and generate a WireGuard profile. The default `wgcf` download is version-pinned and SHA256-verified; MicroSOCKS is built from a pinned commit.
+A new installation prepares files and enables startup at boot; add `--start` to start or restart immediately. An upgrade restores a service that was running before installation. When the tunnel profile is missing, startup reuses an existing WARP account to generate it. It runs `wgcf register --accept-tos` only when no account exists. The default `wgcf` download is version-pinned and SHA256-verified; MicroSOCKS is built from a pinned commit.
 
 Defaults are `/opt/cfwarp` for runtime files, `/etc/cfwarp/cfwarp.env` for private configuration, and `/var/lib/cfwarp` for account and tunnel data. Custom paths:
 
@@ -342,7 +342,7 @@ Only when interrupting the active service for evaluation is intended, set:
 CFWARP_ENDPOINT_REFRESH_ACTIVE_MODE=stop-and-probe
 ```
 
-Probes reuse one WireGuard identity and run sequentially to avoid interfering with each other. Candidates have bounded execution time; shutdown stops probing before cleaning resources. A new endpoint is saved only when it meets the improvement threshold. If service recovery fails, refresh attempts to restore the old configuration. Measurements compare candidates at that time; they do not establish long-term bandwidth or reliability.
+Probes reuse one WireGuard identity and run sequentially to avoid interfering with each other. Candidates have bounded execution time; shutdown stops probing before cleaning resources. When the current endpoint is healthy, switching requires the improvement threshold to be met. When it is unavailable, a verified working candidate may be selected. If service recovery fails, refresh attempts to restore the old configuration. Measurements compare candidates at that time; they do not establish long-term bandwidth or reliability.
 
 Trigger manually and inspect logs:
 

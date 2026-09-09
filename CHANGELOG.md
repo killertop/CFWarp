@@ -1,10 +1,10 @@
 # 更新记录 / Changelog
 
-## Unreleased
+## 2026-09-09
 
 ### 中文
 
-本次围绕 Linux WARP 出站代理的配置、安全解析和网络生命周期修复；保留 Shell 控制层，语言评估见 [架构说明](docs/architecture.md)。
+本次围绕 Linux WARP 出站代理的配置、安全解析和网络生命周期修复；保留 Shell 控制层，语言评估见 [架构说明](docs/architecture.md)，验收结果见 [验证记录](docs/validation.md)。
 
 - 新增 `cfwarp` 管理入口，统一服务、日志、健康、自检、刷新与命令执行操作；`env` 只显示配置文件路径。
 - 移除健康检查和 doctor 对响应内容的 `eval`，以数据解析 trace 和指标。
@@ -19,7 +19,7 @@
 
 ### English
 
-This revision focuses on configuration, safe parsing, and the network lifecycle of the Linux WARP egress proxy. The Shell control layer is retained; see the [architecture decision](docs/architecture.md).
+This revision focuses on configuration, safe parsing, and the network lifecycle of the Linux WARP egress proxy. The Shell control layer is retained; see the [architecture decision](docs/architecture.md) and [validation record](docs/validation.md).
 
 - Add the `cfwarp` command for service control, logs, health, diagnostics, refresh, and namespace execution; `env` shows only the configuration path.
 - Remove response-driven `eval` from health checks and doctor; parse trace and metrics as data.

@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![CI](https://github.com/killertop/CFWarp/actions/workflows/ci.yml/badge.svg)](https://github.com/killertop/CFWarp/actions/workflows/ci.yml)
 
-[中文](#中文) · [English](#english) · [使用说明 / Usage](USAGE.md) · [架构 / Architecture](docs/architecture.md)
+[中文](#中文) · [English](#english) · [使用说明 / Usage](USAGE.md) · [架构 / Architecture](docs/architecture.md) · [验证记录 / Validation](docs/validation.md)
 
 ## 中文
 
@@ -121,7 +121,7 @@ sudo editor /etc/cfwarp/cfwarp.env
 sudo systemctl enable --now cfwarp.service
 ```
 
-When no existing configuration is available, first startup registers a WARP account through `wgcf` and generates a tunnel profile. Registration uses the accept-terms option. The health watchdog is enabled by default; daily endpoint refresh is disabled by default.
+When the tunnel profile is missing, CFWarp generates it through `wgcf`, reusing an existing account. It registers a new account only if no account exists; registration uses the accept-terms option. The health watchdog is enabled by default; daily endpoint refresh is disabled by default.
 
 Verify the egress:
 
