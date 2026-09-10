@@ -1,5 +1,9 @@
 # 验证记录 / Validation record
 
+**2026-09-10 补充：** 后续审查确认此版本仍有锁超时传播、异常直连回落、候选初始化、拒绝清理副作用和回滚备份保留问题。以下是历史测试记录，不能证明这些遗漏的异常场景已通过验证。[当前修复与验证记录](validation-2026-09-10.md) 单独记录了后续代码和新增故障测试。
+
+**2026-09-10 update:** Follow-up review found gaps in lock-timeout propagation, direct-egress fallback, candidate initialization, cleanup refusal, and rollback-backup retention. The historical results below do not establish coverage of those missed failure paths. See the [current fix and validation record](validation-2026-09-10.md) for the subsequent code and added fault tests.
+
 日期 / Date: 2026-09-09
 
 运行代码提交 / Tested runtime commit: [`988e896f967325709a7b3b7276e4ee2ed379a017`](https://github.com/killertop/CFWarp/commit/988e896f967325709a7b3b7276e4ee2ed379a017)

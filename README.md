@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![CI](https://github.com/killertop/CFWarp/actions/workflows/ci.yml/badge.svg)](https://github.com/killertop/CFWarp/actions/workflows/ci.yml)
 
-[中文](#中文) · [English](#english) · [使用说明 / Usage](USAGE.md) · [架构 / Architecture](docs/architecture.md) · [验证记录 / Validation](docs/validation.md)
+[中文](#中文) · [English](#english) · [使用说明 / Usage](USAGE.md) · [架构 / Architecture](docs/architecture.md) · [验证记录 / Validation](docs/validation-2026-09-10.md)
 
 ## 中文
 
