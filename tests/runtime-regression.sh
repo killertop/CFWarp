@@ -116,6 +116,7 @@ exit 2
 STUB
 cat > "$TMP/bin/systemctl" <<'STUB'
 #!/bin/sh
+if [ "$1" = show ]; then echo inactive; exit 0; fi
 exit 1
 STUB
 chmod +x "$TMP/bin/"* "$TMP/project/"*.sh "$TMP/project/cfwarp-exec"
@@ -238,6 +239,7 @@ STUB
     [ "$(wc -l < "$TMP/curl-attempts" | tr -d ' ')" = 5 ] || fail 'watchdog explicit override ignored'
     cat > "$TMP/bin/systemctl" <<'STUB'
 #!/bin/sh
+if [ "$1" = show ]; then echo inactive; exit 0; fi
 exit 1
 STUB
 fi
