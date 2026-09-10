@@ -2,6 +2,10 @@
 
 日期 / Date: 2026-09-10
 
+后续 review 发现额外的升级、转发事务和 IPv6 校验缺口，修复与新验收见[升级复查记录](validation-upgrade-2026-09-10.md)。本页是当时测试范围的历史记录。
+
+Later review found additional upgrade, forwarding-transaction, and IPv6 validation gaps. See the [upgrade review record](validation-upgrade-2026-09-10.md) for fixes and new acceptance. This page records the scope tested at that time.
+
 运行代码提交 / Tested runtime commit: [`836c5a6ec30f2cbab2cadc1424c85bdd5f40c3ac`](https://github.com/killertop/CFWarp/commit/836c5a6ec30f2cbab2cadc1424c85bdd5f40c3ac)
 
 ## 中文
