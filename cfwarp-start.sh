@@ -9,6 +9,17 @@ if [ ! -r "$COMMON_FILE" ]; then
 fi
 # shellcheck disable=SC1090
 . "$COMMON_FILE"
+# Resolve the shared lock path without importing configuration into this shell.
+# Once locked, load a fresh snapshot so a just-finished refresh cannot leave
+# startup using settings read before the lock was acquired.
+if [ "${CFWARP_TEST_MODE:-0}" != 1 ]; then
+    CFWARP_START_DATA_DIR=$(
+        cfwarp_load_env "$SCRIPT_DIR" || exit 1
+        printf '%s\n' "${CFWARP_DATA_DIR:-${SCRIPT_DIR}/var}"
+    )
+    cfwarp_lifecycle_lock "$CFWARP_START_DATA_DIR" || exit 1
+    cfwarp_refresh_is_clear || exit 1
+fi
 cfwarp_load_env "$SCRIPT_DIR"
 
 CFWARP_MODE=${CFWARP_MODE:-netns-proxy}
@@ -92,12 +103,12 @@ trap 'exit 143' TERM
 # Bootstrap uses the host network, before any application namespace exists.
 # Supervise it too so a stop cancels downloads and resolver descendants.
 setsid env CFWARP_PREPARE_ONLY=1 CFWARP_PREPARED_ENDPOINTS_FILE="$CFWARP_PREPARED_ENDPOINTS_FILE" \
-    sh "${SCRIPT_DIR}/entrypoint.sh" &
+    sh "${SCRIPT_DIR}/entrypoint.sh" 6>&- &
 CFWARP_CHILD_PID=$!
 wait "$CFWARP_CHILD_PID"
 CFWARP_CHILD_PID=
 CFWARP_NETWORK_STARTED=1
-setsid sh "${SCRIPT_DIR}/cfwarp-netns.sh" up &
+setsid sh "${SCRIPT_DIR}/cfwarp-netns.sh" up 6>&- &
 CFWARP_CHILD_PID=$!
 wait "$CFWARP_CHILD_PID"
 CFWARP_CHILD_PID=
@@ -113,7 +124,7 @@ setsid ip netns exec "$NETNS_NAME" env \
     WGCF_ACCOUNT="$WGCF_ACCOUNT" \
     WG_QUICK_BIN="$WG_QUICK_BIN" \
     CFWARP_PREPARE_ONLY=0 CFWARP_PREPARED_ENDPOINTS_FILE="$CFWARP_PREPARED_ENDPOINTS_FILE" \
-    sh "${SCRIPT_DIR}/entrypoint.sh" &
+    sh "${SCRIPT_DIR}/entrypoint.sh" 6>&- &
 CFWARP_CHILD_PID=$!
 wait "$CFWARP_CHILD_PID"
 CFWARP_CHILD_PID=

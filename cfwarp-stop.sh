@@ -9,6 +9,13 @@ if [ ! -r "$COMMON_FILE" ]; then
 fi
 # shellcheck disable=SC1090
 . "$COMMON_FILE"
+# A failed competing startup must not let ExecStopPost remove resources owned
+# by an already-running controller or by a refresh holding the lifecycle gate.
+CFWARP_STOP_DATA_DIR=$(
+    cfwarp_load_env "$SCRIPT_DIR" || exit 1
+    printf '%s\n' "${CFWARP_DATA_DIR:-${SCRIPT_DIR}/var}"
+)
+cfwarp_lifecycle_lock "$CFWARP_STOP_DATA_DIR" || exit 1
 cfwarp_load_env "$SCRIPT_DIR"
 
 CFWARP_MODE=${CFWARP_MODE:-netns-proxy}

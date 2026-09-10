@@ -51,6 +51,21 @@ valid_score() { printf '%s\n' "$1" | awk '/^[0-9]+([.][0-9]+)?$/ { valid = 1 } E
 score_is_better() { awk -v new="$1" -v old="${2:-}" 'BEGIN { exit old == "" || new + 0 < old + 0 ? 0 : 1 }'; }
 systemd_available() { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }
 
+read_service_state() {
+    SERVICE_STATE=$(systemctl show --property=ActiveState --value "$CFWARP_SERVICE_NAME") || return 1
+    case "$SERVICE_STATE" in
+        inactive|failed) SERVICE_BUSY=0 ;;
+        active|activating|deactivating|reloading|refreshing|maintenance) SERVICE_BUSY=1 ;;
+        *) echo '==> [ERROR] 无法确认主服务状态，拒绝继续刷新。' >&2; return 1 ;;
+    esac
+}
+
+stop_and_confirm_service() {
+    systemctl stop "$CFWARP_SERVICE_NAME" || return 1
+    read_service_state || return 1
+    [ "$SERVICE_BUSY" = 0 ] || { echo '==> [ERROR] 主服务尚未停止，拒绝探测或回滚。' >&2; return 1; }
+}
+
 if [ -f "$WG_CONF" ]; then
     SOURCE_CONF=$WG_CONF
 elif [ -f "$WGCF_PROFILE" ]; then
@@ -90,6 +105,9 @@ ACTIVE_PROBE_PID=
 PROBE_NETWORK_DIRTY=0
 PROBE_WG_CONF="${TMP_ROOT}/${PROBE_WG_IF}.conf"
 SERVICE_NEEDS_RESTORE=0
+CFWARP_CAN_RESTART=1
+LIFECYCLE_LOCKED=0
+REFRESH_GUARD_OWNED=0
 CONFIG_CHANGED=0
 HAD_WG_CONF=0
 [ -f "$WG_CONF" ] && HAD_WG_CONF=1
@@ -160,7 +178,36 @@ restore_original_config() {
     CONFIG_CHANGED=0
 }
 
+acquire_refresh_guard() {
+    [ "$LIFECYCLE_LOCKED" = 0 ] || return 0
+    cfwarp_lifecycle_lock "$CFWARP_DATA_DIR" || return 1
+    LIFECYCLE_LOCKED=1
+    cfwarp_refresh_is_clear || return 1
+    # systemctl startup may have raced the earlier stop/state observation.
+    # New cfwarp-start processes cannot pass fd 6 while we hold this lock.
+    if systemd_available; then
+        read_service_state || return 1
+        [ "$SERVICE_BUSY" = 0 ] || return 1
+    fi
+    printf '%s\n' "$TMP_ROOT/RECOVERY.txt" | cfwarp_atomic_write_from_stdin "$CFWARP_REFRESH_PENDING" || return 1
+    REFRESH_GUARD_OWNED=1
+}
+
+release_refresh_guard() {
+    [ "$LIFECYCLE_LOCKED" = 1 ] || return 0
+    [ "$PROBE_NETWORK_DIRTY" = 0 ] && [ "$CFWARP_CAN_RESTART" = 1 ] || return 1
+    if [ "$REFRESH_GUARD_OWNED" = 1 ]; then
+        rm -f "$CFWARP_REFRESH_PENDING" || return 1
+        REFRESH_GUARD_OWNED=0
+    fi
+    cfwarp_lifecycle_unlock || return 1
+    LIFECYCLE_LOCKED=0
+}
+
 start_and_verify_service() {
+    [ "$CFWARP_CAN_RESTART" = 1 ] && [ "$PROBE_NETWORK_DIRTY" = 0 ] || return 1
+    # Never hold the gate while asking systemd to start a service that needs it.
+    release_refresh_guard || return 1
     record_recovery_event 'Starting service and checking SOCKS/WARP health.' || return 1
     if systemctl start "$CFWARP_SERVICE_NAME" >> "$RECOVERY_LOG" 2>&1 &&
         "$SCRIPT_DIR/cfwarp-healthcheck.sh" --wait >> "$RECOVERY_LOG" 2>&1 &&
@@ -178,14 +225,15 @@ cleanup() {
     trap - EXIT HUP INT TERM
     stop_probe_processes
     if ! cleanup_probe_network >> "$RECOVERY_LOG" 2>&1; then
+        CFWARP_CAN_RESTART=0
         RECOVERY_REQUIRED=1
         CFWARP_EXIT_STATUS=1
         record_recovery_event 'FAILED: probe network cleanup; ownership state must be inspected.' || true
     fi
     if [ "$SERVICE_NEEDS_RESTORE" = "1" ]; then
-        CFWARP_CAN_RESTART=1
         if [ "$CONFIG_CHANGED" = "1" ]; then
-            if ! systemctl stop "$CFWARP_SERVICE_NAME" >> "$RECOVERY_LOG" 2>&1; then
+            if ! stop_and_confirm_service >> "$RECOVERY_LOG" 2>&1 ||
+                ! acquire_refresh_guard >> "$RECOVERY_LOG" 2>&1; then
                 RECOVERY_REQUIRED=1
                 CFWARP_EXIT_STATUS=1
                 CFWARP_CAN_RESTART=0
@@ -211,10 +259,16 @@ cleanup() {
         # A failure during an inactive service's configuration save is also
         # recoverable; do not discard originals after a partial write failure.
         RECOVERY_REQUIRED=1
-        if ! restore_original_config; then
+        if [ "$LIFECYCLE_LOCKED" != 1 ] || ! restore_original_config; then
+            CFWARP_CAN_RESTART=0
             CFWARP_EXIT_STATUS=1
             record_recovery_event 'FAILED: inactive-service configuration rollback.' || true
         fi
+    fi
+    if ! release_refresh_guard; then
+        RECOVERY_REQUIRED=1
+        CFWARP_EXIT_STATUS=1
+        record_recovery_event 'FAILED: startup remains blocked by the refresh recovery marker.' || true
     fi
     if [ "$RECOVERY_REQUIRED" = "1" ]; then
         record_recovery_event "Recovery material retained; refresh exit status: $CFWARP_EXIT_STATUS." || true
@@ -227,6 +281,43 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 143' HUP INT TERM
+
+cat > "$TMP_ROOT/RECOVERY.txt" <<EOF_EARLY_RECOVERY
+Refresh stopped before probing / 刷新尚未开始探测
+Service / 服务: $CFWARP_SERVICE_NAME
+This refresh has not changed configuration. Backups may not yet exist.
+本次刷新尚未改动配置，备份可能尚未创建。
+Inspect recovery.log, service state, and any existing .refresh-pending marker
+in $CFWARP_DATA_DIR before restarting or running another refresh.
+重启或再次刷新前，请检查恢复日志、服务状态及数据目录中的既有阻断标记。
+EOF_EARLY_RECOVERY
+
+if systemd_available; then
+    read_service_state
+    if [ "$SERVICE_BUSY" = 1 ]; then
+        if [ "$CFWARP_ENDPOINT_REFRESH_ACTIVE_MODE" = skip ]; then
+            echo "==> [CFwarp] ${CFWARP_SERVICE_NAME} 正在运行或转换状态，跳过刷新。"
+            exit 0
+        fi
+        SERVICE_NEEDS_RESTORE=1
+        echo "==> [CFwarp] 已启用 stop-and-probe，暂时停止 ${CFWARP_SERVICE_NAME}。"
+        if ! stop_and_confirm_service; then
+            CFWARP_CAN_RESTART=0
+            RECOVERY_REQUIRED=1
+            exit 1
+        fi
+    fi
+fi
+if ! acquire_refresh_guard; then
+    CFWARP_CAN_RESTART=0
+    RECOVERY_REQUIRED=1
+    exit 1
+fi
+# Re-read the source after shutdown and locking; startup may have committed a
+# healthy endpoint while its ExecStartPost check was still running.
+if [ -f "$WG_CONF" ]; then SOURCE_CONF=$WG_CONF; HAD_WG_CONF=1; else SOURCE_CONF=$WGCF_PROFILE; HAD_WG_CONF=0; fi
+CURRENT_ENDPOINT=$(config_endpoint "$SOURCE_CONF")
+CURRENT_ENDPOINT=${CURRENT_ENDPOINT:-$ENDPOINT_IP}
 
 install -m 0600 "$SOURCE_CONF" "${TMP_ROOT}/original-wg.conf"
 install -m 0600 "$CFWARP_ENV_FILE" "${TMP_ROOT}/original.env"
@@ -242,6 +333,7 @@ WireGuard runtime destination / WireGuard 运行配置位置: $WG_CONF
 Runtime config existed before refresh / 刷新前运行配置存在 (1=yes, 0=no): $HAD_WG_CONF
 Probe namespace / 探测命名空间: $PROBE_NETNS
 Probe ownership state / 探测资源归属状态: $PROBE_STATE_DIR
+Startup block / 启动阻断标记: $CFWARP_REFRESH_PENDING
 Log / 日志: $RECOVERY_LOG
 Health check command / 健康检查脚本: ${SCRIPT_DIR}/cfwarp-healthcheck.sh --wait
 
@@ -255,9 +347,12 @@ Manual recovery / 人工恢复:
    config generated by this refresh; the backup came from the profile source.
    若运行配置原先存在(1)，恢复 original-wg.conf，权限 0600；若原先不存在(0)，
    核实后仅移除本次刷新生成的运行配置，备份来自原 profile。
-4. Check any remaining probe ownership state. Start the service, run the health
+4. Clean any remaining probe resources using their ownership state. Confirm the
+   probe WireGuard interface is gone and configuration recovery is complete,
+   then remove the startup block above. Start the service, run the health
    check with the same CFWARP_ENV_FILE, and verify that the service stays active.
-   核查探测资源归属状态；启动服务，用相同环境文件运行健康检查，并确认服务持续运行。
+   按归属状态清理探测残留；确认探测 WireGuard 接口已删除且配置恢复完整后，
+   删除上述启动阻断标记，再启动服务并用相同环境文件运行健康检查。
 5. Delete only this recovery directory after recovery has been verified.
    仅在验证恢复完成后，删除本次恢复目录。
 
@@ -265,16 +360,6 @@ Backups contain credentials. Do not publish them or source them as shell code.
 备份包含凭证，请勿公开或作为 Shell 脚本执行。
 EOF_RECOVERY
 record_recovery_event 'Protected original configurations saved before refresh.'
-
-if systemd_available && systemctl is-active --quiet "$CFWARP_SERVICE_NAME"; then
-    if [ "$CFWARP_ENDPOINT_REFRESH_ACTIVE_MODE" = "skip" ]; then
-        echo "==> [CFwarp] ${CFWARP_SERVICE_NAME} 正在运行，默认跳过刷新以避免停服。"
-        exit 0
-    fi
-    SERVICE_NEEDS_RESTORE=1
-    echo "==> [CFwarp] 已启用 stop-and-probe，暂时停止 ${CFWARP_SERVICE_NAME}。"
-    systemctl stop "$CFWARP_SERVICE_NAME"
-fi
 
 CANDIDATE_FILE="${TMP_ROOT}/candidates.txt"
 {
@@ -335,7 +420,7 @@ while IFS= read -r CANDIDATE_ENDPOINT; do
         CFWARP_PROBE_MODE=1 CFWARP_PROBE_URL="$CFWARP_ENDPOINT_PROBE_URL" \
         CFWARP_PROBE_SAMPLES="$CFWARP_ENDPOINT_PROBE_SAMPLES" CFWARP_PROBE_METRICS_FILE="$CANDIDATE_METRICS" \
         setsid timeout --kill-after=5 "$CFWARP_ENDPOINT_CANDIDATE_TIMEOUT_SECONDS" \
-        sh "${TMP_ROOT}/worker.sh" > "${CANDIDATE_DIR}/probe.log" 2>&1 9>&- &
+        sh "${TMP_ROOT}/worker.sh" > "${CANDIDATE_DIR}/probe.log" 2>&1 9>&- 6>&- &
     ACTIVE_PROBE_PID=$!
     PROBE_STATUS=0
     wait "$ACTIVE_PROBE_PID" || PROBE_STATUS=$?

@@ -11,8 +11,10 @@ test: check
 	@sh tests/install-refusal-regression.sh
 	@sh tests/install-upgrade-regression.sh
 	@sh tests/refresh-recovery-regression.sh
+	@python3 tests/refresh-lifecycle-regression.py
 
 integration: test
 	@sudo sh tests/network-regression.sh --live
 	@sudo python3 tests/network-egress-regression.py --live
 	@sudo sh tests/install-regression.sh --live
+	@sudo python3 tests/refresh-lifecycle-regression.py --live

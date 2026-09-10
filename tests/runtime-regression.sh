@@ -351,10 +351,11 @@ if command -v setsid >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1 && co
 #!/bin/sh
 set -eu
 case "$1" in
+    show) cat "$FAKE_ROOT/service-state" ;;
     is-active) [ "$(cat "$FAKE_ROOT/service-state")" = active ] ;;
     stop)
         printf 'stop\n' >> "$FAKE_ROOT/service-events"
-        printf 'stopped\n' > "$FAKE_ROOT/service-state"
+        printf 'inactive\n' > "$FAKE_ROOT/service-state"
         ;;
     start)
         printf 'start\n' >> "$FAKE_ROOT/service-events"

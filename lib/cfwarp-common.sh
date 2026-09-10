@@ -98,6 +98,36 @@ cfwarp_load_env() {
     export CFWARP_ENV_LOADED
 }
 
+# Main startup and endpoint refresh share fd 6 for their whole network lifetime.
+# The data directory is root-controlled, as are the existing private profiles.
+cfwarp_lifecycle_lock() {
+    case "$1" in /*) ;; *) echo '==> [ERROR] 生命周期数据目录必须为绝对路径。' >&2; return 1 ;; esac
+    command -v flock >/dev/null 2>&1 || return 1
+    install -d -m 0700 "$1" || return 1
+    CFWARP_LIFECYCLE_DIR=$(CDPATH='' cd -- "$1" && pwd -P) || return 1
+    CFWARP_REFRESH_PENDING="$CFWARP_LIFECYCLE_DIR/.refresh-pending"
+    CFWARP_LIFECYCLE_FILE="$CFWARP_LIFECYCLE_DIR/.service-probe.lock"
+    [ ! -L "$CFWARP_LIFECYCLE_FILE" ] || return 1
+    exec 6>>"$CFWARP_LIFECYCLE_FILE"
+    if ! flock -n 6; then
+        exec 6>&-
+        echo '==> [ERROR] 主服务或 Endpoint 刷新正在使用此数据目录，拒绝并发启动。' >&2
+        return 1
+    fi
+}
+
+cfwarp_lifecycle_unlock() {
+    flock -u 6 || return 1
+    exec 6>&-
+}
+
+cfwarp_refresh_is_clear() {
+    if [ -e "$CFWARP_REFRESH_PENDING" ] || [ -L "$CFWARP_REFRESH_PENDING" ]; then
+        echo "==> [ERROR] 刷新恢复尚未完成，拒绝启动或再次探测；请检查 ${CFWARP_REFRESH_PENDING}。" >&2
+        return 1
+    fi
+}
+
 cfwarp_is_uint() {
     case "${1:-}" in
         ''|*[!0-9]*) return 1 ;;

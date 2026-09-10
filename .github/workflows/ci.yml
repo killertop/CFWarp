@@ -35,3 +35,5 @@ jobs:
         run: sudo sh tests/install-regression.sh --live
       - name: Check diff whitespace
         run: git diff --check
+      - name: Refresh lifecycle and systemd transitions
+        run: sudo python3 tests/refresh-lifecycle-regression.py --live

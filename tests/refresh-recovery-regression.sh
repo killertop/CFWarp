@@ -12,11 +12,20 @@ REAL_MV=$(command -v mv)
 export REAL_MV
 mkdir -p "$TMP/project/lib" "$TMP/bin"
 cp "$ROOT/lib/cfwarp-common.sh" "$TMP/project/lib/cfwarp-common.sh"
+cp "$ROOT/cfwarp-start.sh" "$TMP/project/cfwarp-start.sh"
 # Only OS service detection is substituted; the complete production refresh
 # and rollback implementation runs unchanged against the command fixtures.
 sed 's@\[ -d /run/systemd/system \]@true@' "$REFRESH_UNDER_TEST" > "$TMP/project/cfwarp-refresh-endpoint.sh"
 cat > "$TMP/project/cfwarp-netns.sh" <<'STUB'
 #!/bin/sh
+set -eu
+case "$1" in
+    up) touch "$CASE_ROOT/probe-kernel-live" ;;
+    down)
+        [ "$RECOVERY_SCENARIO" != probe_cleanup_failed ] || exit 1
+        rm -f "$CASE_ROOT/probe-kernel-live"
+        ;;
+esac
 exit 0
 STUB
 cat > "$TMP/project/entrypoint.sh" <<'STUB'
@@ -40,7 +49,7 @@ checks=$((checks + 1))
 printf '%s\n' "$checks" > "$CASE_ROOT/health-count"
 printf 'health-%s\n' "$checks" >> "$CASE_ROOT/events"
 case "$RECOVERY_SCENARIO" in
-    success|success_hostname) exit 0 ;;
+    success|success_hostname|stop_activating|stop_deactivating|stop_reloading) exit 0 ;;
     recovered) [ "$checks" -gt 1 ] && exit 0 ;;
 esac
 : > "$CASE_ROOT/restore-phase"
@@ -51,13 +60,20 @@ cat > "$TMP/bin/systemctl" <<'STUB'
 #!/bin/sh
 set -eu
 case "$1" in
+    show)
+        [ "$RECOVERY_SCENARIO" != state_read_failed ] || exit 1
+        cat "$CASE_ROOT/service-state"
+        ;;
     is-active) [ "$(cat "$CASE_ROOT/service-state")" = active ] ;;
     stop)
         printf 'stop\n' >> "$CASE_ROOT/events"
+        [ "$RECOVERY_SCENARIO" != initial_stop_failed ] || exit 1
+        [ "$RECOVERY_SCENARIO" != stop_still_busy ] || exit 0
         if [ "$RECOVERY_SCENARIO" = stop_failed ] && [ -f "$CASE_ROOT/restore-phase" ]; then exit 1; fi
         printf 'inactive\n' > "$CASE_ROOT/service-state"
         ;;
     start)
+        [ ! -e "$CASE_ROOT/probe-kernel-live" ] || { echo 'unsafe start with live probe' >&2; exit 98; }
         printf 'start\n' >> "$CASE_ROOT/events"
         starts=$(cat "$CASE_ROOT/start-count")
         printf '%s\n' "$((starts + 1))" > "$CASE_ROOT/start-count"
@@ -125,6 +141,14 @@ run_case() {
     cp "$WG_CONF" "$CASE_ROOT/expected-wg.conf"
     sed 's/192.0.2.10/192.0.2.20/' "$WG_CONF" > "$CASE_ROOT/new-wg.conf"
     printf 'active\n' > "$CASE_ROOT/service-state"
+    active_mode=stop-and-probe
+    case "$RECOVERY_SCENARIO" in
+        skip_*|stop_activating|stop_deactivating|stop_reloading)
+            printf '%s\n' "${RECOVERY_SCENARIO#*_}" > "$CASE_ROOT/service-state"
+            case "$RECOVERY_SCENARIO" in skip_*) active_mode=skip ;; esac
+            ;;
+        state_unknown) printf 'unknown\n' > "$CASE_ROOT/service-state" ;;
+    esac
     printf '0\n' > "$CASE_ROOT/start-count"
     printf '0\n' > "$CASE_ROOT/health-count"
     : > "$CASE_ROOT/events"
@@ -133,9 +157,24 @@ run_case() {
     run_status=0
     TMPDIR="$CASE_ROOT/tmp" CFWARP_ENV_LOADED=1 CFWARP_MODE=netns-proxy \
         CFWARP_ENDPOINT_REFRESH_STATE_ROOT="$CASE_ROOT/run" \
-        CFWARP_ENDPOINT_REFRESH_ACTIVE_MODE=stop-and-probe \
+        CFWARP_ENDPOINT_REFRESH_ACTIVE_MODE="$active_mode" \
         ENDPOINT_IP=192.0.2.10:2408 ENDPOINT_CANDIDATES="$test_candidates" \
         sh "$TMP/project/cfwarp-refresh-endpoint.sh" > "$CASE_ROOT/output" 2>&1 || run_status=$?
+    case "$RECOVERY_SCENARIO" in
+        skip_*|state_read_failed|state_unknown|initial_stop_failed|stop_still_busy)
+            case "$RECOVERY_SCENARIO" in skip_*) [ "$run_status" = 0 ] || fail 'busy skip failed' ;; *) [ "$run_status" != 0 ] || fail 'unsafe state accepted' ;; esac
+            [ ! -e "$CASE_ROOT/probe-targets" ] || fail 'probe reached before confirmed stop'
+            [ "$(cat "$CASE_ROOT/start-count")" = 0 ] || fail 'unsafe state caused a start'
+            cmp "$CFWARP_ENV_FILE" "$CASE_ROOT/expected.env" || fail 'refusal changed configuration'
+            return 0
+            ;;
+        stop_activating|stop_deactivating|stop_reloading)
+            [ "$run_status" = 0 ] || { cat "$CASE_ROOT/output"; fail 'transitional stop/probe failed'; }
+            [ "$(head -n 1 "$CASE_ROOT/events")" = stop ] || fail 'probe was not preceded by stop'
+            [ "$(cat "$CASE_ROOT/start-count")" = 1 ] || fail 'transitional service was not restored'
+            return 0
+            ;;
+    esac
     if [ "$RECOVERY_SCENARIO" = success ] || [ "$RECOVERY_SCENARIO" = success_hostname ]; then
         [ "$run_status" -eq 0 ] || { cat "$CASE_ROOT/output" >&2; fail 'successful deployment failed'; }
         [ -z "$(find "$CFWARP_DATA_DIR/recovery" -name original.env -print 2>/dev/null)" ] || fail 'successful run retained its backup'
@@ -162,6 +201,13 @@ run_case() {
         [ "$permissions" = 600 ] || fail "recovery file permissions are unsafe: $protected"
     done
     case "$RECOVERY_SCENARIO" in
+        probe_cleanup_failed)
+            [ "$(cat "$CASE_ROOT/start-count")" = 0 ] || fail 'failed cleanup restarted main'
+            [ -e "$CFWARP_DATA_DIR/.refresh-pending" ] || fail 'failed cleanup lost startup block'
+            if CFWARP_ENV_LOADED=1 sh "$TMP/project/cfwarp-start.sh" > "$CASE_ROOT/blocked-start" 2>&1; then fail 'pending cleanup allowed a later startup'; fi
+            grep -F '.refresh-pending' "$CASE_ROOT/blocked-start" >/dev/null || { cat "$CASE_ROOT/blocked-start" >&2; fail 'startup did not explain pending recovery'; }
+            rm -f "$CASE_ROOT/probe-kernel-live"
+            ;;
         env_write_failed|wg_write_failed|stop_failed)
             [ "$(cat "$CASE_ROOT/start-count")" = 1 ] || fail 'partially restored service was started'
             ;;
@@ -176,6 +222,10 @@ run_case() {
     RECOVERY_SCENARIO=success
     export RECOVERY_SCENARIO
     rm -f "$CASE_ROOT/restore-phase"
+    # Model an operator completing recovery before permitting another refresh.
+    cp "$CASE_ROOT/expected.env" "$CFWARP_ENV_FILE"
+    cp "$CASE_ROOT/expected-wg.conf" "$WG_CONF"
+    rm -f "$CFWARP_DATA_DIR/.refresh-pending"
     printf 'active\n' > "$CASE_ROOT/service-state"
     TMPDIR="$CASE_ROOT/tmp" CFWARP_ENV_LOADED=1 CFWARP_MODE=netns-proxy \
         CFWARP_ENDPOINT_REFRESH_STATE_ROOT="$CASE_ROOT/run" \
@@ -186,7 +236,9 @@ run_case() {
     cmp "$SAVED_RECOVERY_DIR/original-wg.conf" "$CASE_ROOT/expected-wg.conf" || fail 'later refresh changed previous recovery evidence'
 }
 
-for scenario in env_write_failed wg_write_failed verify_failed recovered stop_failed success success_hostname; do
+for scenario in env_write_failed wg_write_failed verify_failed recovered stop_failed success success_hostname \
+    skip_activating skip_deactivating skip_reloading stop_activating stop_deactivating stop_reloading \
+    state_read_failed state_unknown initial_stop_failed stop_still_busy probe_cleanup_failed; do
     run_case "$scenario"
 done
 echo 'CFWarp refresh recovery regression tests passed'
