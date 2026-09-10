@@ -135,6 +135,9 @@ class Regression(unittest.TestCase):
                     valid = False
                 r = self.shell('cfwarp_resolve_endpoint "$1"', f"[{address}]:2408")
                 self.assertEqual(r.returncode == 0, valid, r.stderr)
+        for endpoint in ("[::1]:junk:2408", "[::1]:2408:2408", "[::1]:2408]:2408"):
+            with self.subTest(endpoint=endpoint):
+                self.assertNotEqual(self.shell('cfwarp_resolve_endpoint "$1"', endpoint).returncode, 0)
 
     def test_installed_doctor_uses_runtime_manifest(self):
         installed = self.base / "installed"

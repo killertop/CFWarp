@@ -210,11 +210,13 @@ printf 'prepared.invalid:2408\t192.0.2.40:2408\n' > "$TMP/prepared-map"
 CFWARP_PREPARED_ENDPOINTS_FILE="$TMP/prepared-map" ENDPOINT_IP='' \
     sh "$TMP/project/entrypoint.sh" > "$TMP/prepared.out" 2>&1 || fail 'prepared domain mapping failed'
 grep -Fx 'Endpoint = prepared.invalid:2408' "$WG_CONF" >/dev/null || fail 'configured domain identity lost'
-sed 's/stale.invalid:2408/[::::]:2408/' "$TMP/stale-original.conf" > "$WG_CONF"
-: > "$TMP/up-endpoints"
-ENDPOINT_IP='' ENDPOINT_CANDIDATES='192.0.2.30:2408' \
-    sh "$TMP/project/entrypoint.sh" > "$TMP/invalid-ipv6.out" 2>&1 || fail 'invalid IPv6 blocked valid fallback'
-[ "$(cat "$TMP/up-endpoints")" = 'Endpoint = 192.0.2.30:2408' ] || fail 'invalid IPv6 reached wg-quick'
+for bad_ipv6 in '[::::]:2408' '[::1]:junk:2408' '[::1]:2408:2408' '[::1]:2408]:2408'; do
+    sed "s/stale.invalid:2408/$bad_ipv6/" "$TMP/stale-original.conf" > "$WG_CONF"
+    : > "$TMP/up-endpoints"
+    ENDPOINT_IP='' ENDPOINT_CANDIDATES='192.0.2.30:2408' \
+        sh "$TMP/project/entrypoint.sh" > "$TMP/invalid-ipv6.out" 2>&1 || fail 'invalid IPv6 blocked valid fallback'
+    [ "$(cat "$TMP/up-endpoints")" = 'Endpoint = 192.0.2.30:2408' ] || fail 'invalid IPv6 reached wg-quick'
+done
 cp "$TMP/base.conf" "$WG_CONF"
 
 # Watchdog owns its retry policy; inherited ordinary health options never

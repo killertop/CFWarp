@@ -208,6 +208,7 @@ cfwarp_validate_endpoint() {
             CFWARP_COMMON_HOST=${CFWARP_COMMON_ENDPOINT#\[}
             CFWARP_COMMON_HOST=${CFWARP_COMMON_HOST%%\]:*}
             CFWARP_COMMON_PORT=${CFWARP_COMMON_ENDPOINT##*:}
+            [ "$CFWARP_COMMON_ENDPOINT" = "[$CFWARP_COMMON_HOST]:$CFWARP_COMMON_PORT" ] || return 1
             [ -n "$CFWARP_COMMON_HOST" ] || return 1
             case "$CFWARP_COMMON_HOST" in *[!0-9A-Fa-f:.]*|*..*) return 1 ;; esac
             case "$CFWARP_COMMON_HOST" in *:*) ;; *) return 1 ;; esac
