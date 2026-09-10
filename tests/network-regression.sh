@@ -17,12 +17,13 @@ TEST_TAG=cft$$
 REAL_IP=$(command -v ip)
 REAL_SYSCTL=$(command -v sysctl)
 REAL_IPTABLES=$(command -v iptables)
+REAL_MV=$(command -v mv)
 HOST_TEST_IF="${TEST_TAG}w"
 INITIAL_FORWARD=$($REAL_SYSCTL -n net.ipv4.ip_forward)
 CFWARP_TEST_UNIT=
 CFWARP_TEST_MOUNT_NS=
 CFWARP_TEST_START_PID=
-export TMP_DIR REAL_IP REAL_SYSCTL REAL_IPTABLES
+export TMP_DIR REAL_IP REAL_SYSCTL REAL_IPTABLES REAL_MV
 mkdir -p "$TMP_DIR/bin" "$TMP_DIR/state" "$TMP_DIR/global"
 WG_QUICK_BIN="$TMP_DIR/bin/wg-quick"
 export WG_QUICK_BIN
@@ -46,7 +47,7 @@ cleanup() {
     CFWARP_TEST_STATUS=$?
     trap - EXIT
     trap '' HUP INT TERM
-    unset CFWARP_FAIL_STEP NETNS_DNS_SERVERS CFWARP_FAIL_IPTABLES_CHECK
+    unset CFWARP_FAIL_STEP NETNS_DNS_SERVERS CFWARP_FAIL_IPTABLES_CHECK CFWARP_FAIL_STATE_TARGET CFWARP_FAIL_STATE_HELD
     if [ -n "$CFWARP_TEST_START_PID" ]; then
         kill -TERM "$CFWARP_TEST_START_PID" 2>/dev/null || true
         wait "$CFWARP_TEST_START_PID" 2>/dev/null || true
@@ -111,6 +112,13 @@ if [ "$1" = '-w' ]; then
     fi
 fi
 exec "$REAL_SYSCTL" "$@"
+STUB
+cat > "$TMP_DIR/bin/mv" <<'STUB'
+#!/bin/sh
+for target in "$@"; do :; done
+if [ "$target" = "${CFWARP_FAIL_STATE_TARGET:-}" ] && \
+   grep -qx "IP_FORWARD_REF_HELD=${CFWARP_FAIL_STATE_HELD:-}" "$1"; then exit 96; fi
+exec "$REAL_MV" "$@"
 STUB
 chmod +x "$TMP_DIR/bin/"*
 "$REAL_SYSCTL" -w net.ipv4.ip_forward=0 >/dev/null
@@ -191,6 +199,47 @@ while [ "$CFWARP_TEST_ROUND" -lt 3 ]; do
 done
 [ ! -e "$TMP_DIR/unlocked-kernel-write" ]
 echo 'PASS: custom DNS, two-instance refs, concurrent acquire/release, locked sysctl'
+
+# Real namespace/forwarding state with a failed atomic owner-state commit.
+# Repeating teardown must never consume the other live instance's reference.
+run_netns a up
+run_netns b up
+CFWARP_FAIL_STATE_TARGET="$TMP_DIR/state/${TEST_TAG}a.env"
+CFWARP_FAIL_STATE_HELD=0
+export CFWARP_FAIL_STATE_TARGET CFWARP_FAIL_STATE_HELD
+for attempt in 1 2; do
+    if run_netns a down > "$TMP_DIR/state-release-$attempt.log" 2>&1; then exit 1; fi
+    [ "$(cat "$TMP_DIR/global/ip_forward.refs")" = 1 ]
+    [ "$($REAL_SYSCTL -n net.ipv4.ip_forward)" = 1 ]
+    [ -e "/run/netns/${TEST_TAG}b" ]
+    grep -qx IP_FORWARD_REF_HELD=1 "$TMP_DIR/state/${TEST_TAG}b.env"
+    [ -e "$TMP_DIR/global/ip_forward.pending" ]
+done
+unset CFWARP_FAIL_STATE_TARGET CFWARP_FAIL_STATE_HELD
+run_netns a down
+[ "$(cat "$TMP_DIR/global/ip_forward.refs")" = 1 ]
+[ ! -e "$TMP_DIR/global/ip_forward.pending" ]
+run_netns b down
+[ "$($REAL_SYSCTL -n net.ipv4.ip_forward)" = 0 ]
+
+# An acquire-state failure runs the production EXIT cleanup; retry completes
+# the pending acquisition and releases it exactly once while B stays alive.
+run_netns b up
+CFWARP_FAIL_STATE_TARGET="$TMP_DIR/state/${TEST_TAG}a.env"
+CFWARP_FAIL_STATE_HELD=1
+export CFWARP_FAIL_STATE_TARGET CFWARP_FAIL_STATE_HELD
+if run_netns a up > "$TMP_DIR/state-acquire.log" 2>&1; then exit 1; fi
+[ ! -e "/run/netns/${TEST_TAG}a" ]
+[ -e "$TMP_DIR/global/ip_forward.pending" ]
+[ "$(cat "$TMP_DIR/global/ip_forward.refs")" = 2 ]
+unset CFWARP_FAIL_STATE_TARGET CFWARP_FAIL_STATE_HELD
+run_netns a down
+[ "$(cat "$TMP_DIR/global/ip_forward.refs")" = 1 ]
+[ "$($REAL_SYSCTL -n net.ipv4.ip_forward)" = 1 ]
+[ ! -e "$TMP_DIR/global/ip_forward.pending" ]
+run_netns b down
+[ "$($REAL_SYSCTL -n net.ipv4.ip_forward)" = 0 ]
+echo 'PASS: real forwarding survives acquire/release state-write failure and fresh-process retries'
 
 # Backend/lock errors are not equivalent to an absent iptables rule. Persist
 # cleanup state and keep forwarding refs until a successful retry removes rules.

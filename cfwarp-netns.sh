@@ -36,6 +36,7 @@ CFWARP_LOCK_WAIT_SECONDS=${CFWARP_LOCK_WAIT_SECONDS:-30}
 IP_FORWARD_PREV_FILE="${CFWARP_GLOBAL_STATE_DIR}/ip_forward.prev"
 IP_FORWARD_REF_FILE="${CFWARP_GLOBAL_STATE_DIR}/ip_forward.refs"
 IP_FORWARD_LOCK_FILE="${CFWARP_GLOBAL_STATE_DIR}/ip_forward.flock"
+IP_FORWARD_PENDING_FILE="${CFWARP_GLOBAL_STATE_DIR}/ip_forward.pending"
 STATE_FILE="${CFWARP_STATE_DIR}/${NETNS_NAME}.env"
 RESOLV_DIR="/etc/netns/${NETNS_NAME}"
 IP_FORWARD_REF_HELD=0
@@ -148,50 +149,148 @@ unlock_ip_forward_state() {
 }
 
 read_ref_count() {
-    CFWARP_REF_COUNT=$(cat "$IP_FORWARD_REF_FILE" 2>/dev/null || printf '0\n')
+    if [ -e "$IP_FORWARD_REF_FILE" ]; then
+        CFWARP_REF_COUNT=$(cat "$IP_FORWARD_REF_FILE") || return 1
+    else
+        CFWARP_REF_COUNT=0
+    fi
     cfwarp_validate_uint "$CFWARP_REF_COUNT" ip_forward.refs 0 2147483646
 }
 
-acquire_ip_forward_ref() {
-    # Every failure returns explicitly: callers may use if/||, which disables
-    # errexit throughout a shell function's call tree.
-    lock_ip_forward_state || return 1
-    read_ref_count || return 1
-    if [ "$CFWARP_REF_COUNT" -eq 0 ]; then
-        CFWARP_CURRENT_FORWARD=$(sysctl -n net.ipv4.ip_forward) || return 1
-        case "$CFWARP_CURRENT_FORWARD" in 0|1) ;; *) fail '无法读取 ip_forward。'; return 1 ;; esac
-        printf '%s\n' "$CFWARP_CURRENT_FORWARD" | cfwarp_atomic_write_from_stdin "$IP_FORWARD_PREV_FILE" || return 1
+forward_state_held() {
+    awk '
+        /^IP_FORWARD_REF_HELD=/ { count++; held=substr($0,index($0,"=")+1) }
+        END { if (count != 1 || held !~ /^[01]$/) exit 1; print held }
+    ' "$1"
+}
+
+forward_state_matches_inode() {
+    [ -f "$1" ] && [ ! -L "$1" ] || return 1
+    awk -v expected="$2" '
+        /^NS_INODE=/ { count++; inode=substr($0,index($0,"=")+1) }
+        END { exit !(count == 1 && "x" inode == "x" expected) }
+    ' "$1"
+}
+
+sync_forward_held() {
+    if [ -e "$STATE_FILE" ]; then
+        IP_FORWARD_REF_HELD=$(forward_state_held "$STATE_FILE") || return 1
+    else
+        IP_FORWARD_REF_HELD=0
     fi
-    CFWARP_REF_COUNT=$((CFWARP_REF_COUNT + 1))
-    printf '%s\n' "$CFWARP_REF_COUNT" | cfwarp_atomic_write_from_stdin "$IP_FORWARD_REF_FILE" || return 1
-    IP_FORWARD_REF_HELD=1
-    # Kernel mutation and reference bookkeeping share the same kernel lock.
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null || return 1
-    write_state_file || return 1
+}
+
+forward_plan_value() {
+    awk -v key="$1" '
+        index($0,key "=")==1 { count++; value=substr($0,length(key)+2) }
+        END { if (count != 1) exit 1; print value }
+    ' "$IP_FORWARD_PENDING_FILE"
+}
+
+reconcile_ip_forward_state() (
+    # One journal owns the next absolute values, never a repeatable +1/-1.
+    # Keep it until all files and the kernel agree; every writer holds fd 9.
+    [ -e "$IP_FORWARD_PENDING_FILE" ] || return 0
+    [ "$(forward_plan_value VERSION)" = 1 ] || return 1
+    CFWARP_PENDING_STATE_FILE=$(forward_plan_value STATE_FILE) || return 1
+    CFWARP_PENDING_INODE=$(forward_plan_value NS_INODE) || return 1
+    CFWARP_PENDING_REFS=$(forward_plan_value REFS) || return 1
+    CFWARP_PENDING_PREV=$(forward_plan_value PREV) || return 1
+    CFWARP_PENDING_HELD=$(forward_plan_value HELD) || return 1
+    case "$CFWARP_PENDING_STATE_FILE" in /*) ;; *) fail 'ip_forward journal 状态路径必须为绝对路径。'; return 1 ;; esac
+    cfwarp_validate_uint "$CFWARP_PENDING_INODE" NS_INODE 1 9223372036854775807 || return 1
+    cfwarp_validate_uint "$CFWARP_PENDING_REFS" ip_forward.refs 0 2147483646 || return 1
+    case "$CFWARP_PENDING_PREV:$CFWARP_PENDING_HELD" in 0:0|0:1|1:0|1:1) ;; *) return 1 ;; esac
+    [ "$CFWARP_PENDING_HELD" = 0 ] || [ "$CFWARP_PENDING_REFS" -gt 0 ] || return 1
+    forward_state_matches_inode "$CFWARP_PENDING_STATE_FILE" "$CFWARP_PENDING_INODE" || {
+        fail 'ip_forward journal 的 namespace 所有权已改变。'; return 1;
+    }
+    forward_state_held "$CFWARP_PENDING_STATE_FILE" >/dev/null || return 1
+    printf '%s\n' "$CFWARP_PENDING_PREV" | cfwarp_atomic_write_from_stdin "$IP_FORWARD_PREV_FILE" || return 1
+    printf '%s\n' "$CFWARP_PENDING_REFS" | cfwarp_atomic_write_from_stdin "$IP_FORWARD_REF_FILE" || return 1
+    # A previous teardown may already have changed its DNS/rule ownership.
+    # Patch only the membership flag, preserving those newer state fields.
+    CFWARP_PENDING_STATE=$(awk -v held="$CFWARP_PENDING_HELD" '
+        /^IP_FORWARD_REF_HELD=/ { print "IP_FORWARD_REF_HELD=" held; next }
+        { print }
+    ' "$CFWARP_PENDING_STATE_FILE") || return 1
+    printf '%s\n' "$CFWARP_PENDING_STATE" | cfwarp_atomic_write_from_stdin "$CFWARP_PENDING_STATE_FILE" || return 1
+    CFWARP_PENDING_KERNEL=1
+    [ "$CFWARP_PENDING_REFS" -gt 0 ] || CFWARP_PENDING_KERNEL=$CFWARP_PENDING_PREV
+    sysctl -w "net.ipv4.ip_forward=$CFWARP_PENDING_KERNEL" >/dev/null || return 1
+    if [ "$CFWARP_PENDING_REFS" -eq 0 ]; then
+        rm -f "$IP_FORWARD_REF_FILE" "$IP_FORWARD_PREV_FILE" || return 1
+    fi
+    rm -f "$IP_FORWARD_PENDING_FILE"
+)
+
+commit_forward_plan() {
+    # STATE_DIR may differ between instances sharing GLOBAL_STATE_DIR. Resolve
+    # the target directory now so another controller can reconcile this plan.
+    CFWARP_FORWARD_TARGET_DIR=$(CDPATH='' cd -- "$(dirname "$STATE_FILE")" && pwd) || return 1
+    CFWARP_FORWARD_TARGET_FILE="${CFWARP_FORWARD_TARGET_DIR}/$(basename "$STATE_FILE")"
+    cfwarp_validate_uint "$CFWARP_NS_INODE" NS_INODE 1 9223372036854775807 || return 1
+    forward_state_matches_inode "$CFWARP_FORWARD_TARGET_FILE" "$CFWARP_NS_INODE" || {
+        fail 'ip_forward 操作缺少匹配的 namespace 所有权状态。'; return 1;
+    }
+    cfwarp_atomic_write_from_stdin "$IP_FORWARD_PENDING_FILE" <<EOF_FORWARD_PLAN
+VERSION=1
+STATE_FILE=$CFWARP_FORWARD_TARGET_FILE
+NS_INODE=$CFWARP_NS_INODE
+REFS=$1
+PREV=$2
+HELD=$3
+EOF_FORWARD_PLAN
+    CFWARP_FORWARD_PLAN_STATUS=$?
+    [ "$CFWARP_FORWARD_PLAN_STATUS" -eq 0 ] || return "$CFWARP_FORWARD_PLAN_STATUS"
+    reconcile_ip_forward_state || return 1
+    sync_forward_held
+}
+
+acquire_ip_forward_ref() {
+    # Explicit returns also protect conditional callers, where errexit is off.
+    lock_ip_forward_state || return 1
+    reconcile_ip_forward_state || return 1
+    sync_forward_held || return 1
+    if [ "$IP_FORWARD_REF_HELD" -eq 0 ]; then
+        read_ref_count || return 1
+        [ "$CFWARP_REF_COUNT" -lt 2147483646 ] || return 1
+        if [ "$CFWARP_REF_COUNT" -eq 0 ]; then
+            CFWARP_PREVIOUS_FORWARD=$(sysctl -n net.ipv4.ip_forward) || return 1
+        else
+            CFWARP_PREVIOUS_FORWARD=$(cat "$IP_FORWARD_PREV_FILE") || return 1
+        fi
+        case "$CFWARP_PREVIOUS_FORWARD" in 0|1) ;; *) fail '无法读取 ip_forward 原始状态。'; return 1 ;; esac
+        commit_forward_plan "$((CFWARP_REF_COUNT + 1))" "$CFWARP_PREVIOUS_FORWARD" 1 || return 1
+    fi
     unlock_ip_forward_state || return 1
     check_signal
 }
 
 release_ip_forward_ref() {
-    [ "$IP_FORWARD_REF_HELD" -eq 1 ] || return 0
     lock_ip_forward_state || return 1
-    read_ref_count || return 1
-    [ "$CFWARP_REF_COUNT" -gt 0 ] || { fail 'ip_forward 引用状态缺失，保留资源状态供重试。'; return 1; }
-    CFWARP_REF_COUNT=$((CFWARP_REF_COUNT - 1))
-    if [ "$CFWARP_REF_COUNT" -eq 0 ]; then
-        CFWARP_PREVIOUS_FORWARD=$(cat "$IP_FORWARD_PREV_FILE" 2>/dev/null || true)
+    reconcile_ip_forward_state || return 1
+    # Reconciliation may have finished this exact release in another process.
+    sync_forward_held || return 1
+    if [ "$IP_FORWARD_REF_HELD" -eq 1 ]; then
+        read_ref_count || return 1
+        [ "$CFWARP_REF_COUNT" -gt 0 ] || { fail 'ip_forward 引用状态缺失，保留资源状态供重试。'; return 1; }
+        CFWARP_PREVIOUS_FORWARD=$(cat "$IP_FORWARD_PREV_FILE") || return 1
         case "$CFWARP_PREVIOUS_FORWARD" in 0|1) ;; *) fail 'ip_forward 原始状态缺失。'; return 1 ;; esac
-        sysctl -w "net.ipv4.ip_forward=${CFWARP_PREVIOUS_FORWARD}" >/dev/null || return 1
-        rm -f "$IP_FORWARD_REF_FILE" "$IP_FORWARD_PREV_FILE" || return 1
-    else
-        printf '%s\n' "$CFWARP_REF_COUNT" | cfwarp_atomic_write_from_stdin "$IP_FORWARD_REF_FILE" || return 1
+        commit_forward_plan "$((CFWARP_REF_COUNT - 1))" "$CFWARP_PREVIOUS_FORWARD" 0 || return 1
     fi
-    IP_FORWARD_REF_HELD=0
-    write_state_file || return 1
     unlock_ip_forward_state
 }
 
 write_state_file() {
+    # A different namespace can reconcile our pending transaction while this
+    # controller waits for the global lock. Never overwrite its committed HELD
+    # flag with an older in-memory value during a later ownership-state write.
+    CFWARP_FORWARD_WRITE_UNLOCK=0
+    [ "$CFWARP_FORWARD_LOCKED" -eq 1 ] || CFWARP_FORWARD_WRITE_UNLOCK=1
+    lock_ip_forward_state || return 1
+    reconcile_ip_forward_state || return 1
+    sync_forward_held || return 1
     # This is data, never sourced as shell code. Newlines were rejected above.
     cfwarp_atomic_write_from_stdin "$STATE_FILE" <<EOF_STATE
 VERSION=2
@@ -212,6 +311,9 @@ DNS_INODE=$CFWARP_DNS_INODE
 RULES_STARTED=$CFWARP_RULES_STARTED
 IP_FORWARD_REF_HELD=$IP_FORWARD_REF_HELD
 EOF_STATE
+    CFWARP_FORWARD_WRITE_STATUS=$?
+    [ "$CFWARP_FORWARD_WRITE_STATUS" -eq 0 ] || return "$CFWARP_FORWARD_WRITE_STATUS"
+    [ "$CFWARP_FORWARD_WRITE_UNLOCK" -eq 0 ] || unlock_ip_forward_state
 }
 
 state_value() {

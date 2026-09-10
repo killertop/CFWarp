@@ -7,7 +7,9 @@ test: check
 	@python3 tests/regression.py
 	@sh tests/runtime-regression.sh
 	@sh tests/network-lock-regression.sh
+	@sh tests/network-refcount-regression.sh
 	@sh tests/install-refusal-regression.sh
+	@sh tests/install-upgrade-regression.sh
 	@sh tests/refresh-recovery-regression.sh
 
 integration: test

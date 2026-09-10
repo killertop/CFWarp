@@ -171,6 +171,33 @@ cfwarp_validate_chain_name() {
     esac
 }
 
+cfwarp_validate_ipv6() {
+    printf '%s\n' "$1" | awk '
+        function groups(s, parts, n, i) {
+            if (s == "") return 0
+            n=split(s,parts,":")
+            for(i=1;i<=n;i++) if(parts[i] !~ /^[0-9A-Fa-f]+$/ || length(parts[i])>4) return -100
+            return n
+        }
+        {
+            value=$0
+            if (value == "" || value ~ /[^0-9A-Fa-f:.]/ || value ~ /:::/) exit 1
+            if (index(value,".")) {
+                tail=value; sub(/^.*:/,"",tail)
+                if (tail == value || split(tail,octets,".") != 4) exit 1
+                for(i=1;i<=4;i++) if(octets[i] !~ /^[0-9]+$/ || octets[i]>255 || (length(octets[i])>1 && octets[i] ~ /^0/)) exit 1
+                value=substr(value,1,length(value)-length(tail)) "0:0"
+            }
+            if (index(value,"::")) {
+                if (split(value,halves,"::") != 2) exit 1
+                left=groups(halves[1]); right=groups(halves[2])
+                if(left<0 || right<0 || left+right>=8) exit 1
+            } else if(groups(value) != 8) exit 1
+        }
+        END {if(NR != 1) exit 1}
+    '
+}
+
 cfwarp_validate_endpoint() {
     CFWARP_COMMON_ENDPOINT=${1:-}
     case "$CFWARP_COMMON_ENDPOINT" in
@@ -184,6 +211,7 @@ cfwarp_validate_endpoint() {
             [ -n "$CFWARP_COMMON_HOST" ] || return 1
             case "$CFWARP_COMMON_HOST" in *[!0-9A-Fa-f:.]*|*..*) return 1 ;; esac
             case "$CFWARP_COMMON_HOST" in *:*) ;; *) return 1 ;; esac
+            cfwarp_validate_ipv6 "$CFWARP_COMMON_HOST" || return 1
             ;;
         *:*)
             case "$CFWARP_COMMON_ENDPOINT" in

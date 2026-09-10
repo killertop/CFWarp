@@ -49,6 +49,10 @@ systemd unit 只传入 `CFWARP_ENV_FILE` 的路径，由所有入口共用的数
 
 升级前应保留旧版本及私有配置备份。安装器先停止正在运行的定时任务和服务，让旧版本自己的清理代码执行，再替换运行文件并按原运行状态恢复服务。旧版状态若无法由新版安全识别，新版会拒绝按资源名称清理；应使用创建该状态的版本完成停服，并核查 namespace、接口、规则和 forwarding 的恢复情况。安装文件更新成功不代表旧资源已清理，已有旧状态也不会被无条件认领或迁移。
 
+转发引用的跨文件更新使用全局锁内的 `ip_forward.pending` 日志，记录目标引用总数、原内核值、实例状态路径和 namespace 身份。所有引用操作先完成未提交事务，以绝对目标值重放，避免状态写入失败后的重试再次增减引用。普通状态写入也在同一锁内同步已提交的引用标记；日志只修改该标记，保留最新 DNS 和规则归属字段。日志提交失败会保留现场并阻止后续引用操作越过它。这针对可重试的写入/系统调用失败，不承诺断电后的持久事务恢复。
+
+升级先停止定时器，再停止并等待包括 `activating` oneshot 在内的辅助服务，随后重新读取并停止主服务，避免取消刷新时恢复的主服务被遗漏。MicroSOCKS 提前编译到暂存文件，停服完成后才发布。安装锁位于专属的 0700 目录，保留系统 `/run/lock` 权限；不再按接口名称补偿清理 host-global 资源。
+
 ### 修复验证说明
 
 `make test` 运行无特权检查与回归；`make integration` 在专用 Linux 测试机运行需要 root 的内核网络验证。
@@ -111,6 +115,10 @@ Units pass only the `CFWARP_ENV_FILE` path. Every entry point uses the shared da
 The new namespace state uses `VERSION=2`, recording the namespace inode, veth ifindex, DNS-file inode, and held forwarding reference. Host-global mode separately records the interface ifindex, public key, and full configuration path, coordinating startup and shutdown with an interface operation lock. These records establish cleanup ownership. Editing a version field or deleting a state file is not a valid way to bypass ownership checks.
 
 Keep the previous version and private configuration backups before upgrading. The installer first stops active timers and services so the previous version's own cleanup code runs, then replaces runtime files and restores the prior running state. If the new version cannot safely interpret old state, it refuses cleanup based only on resource names. Use the version that created that state to stop the service, then verify namespaces, interfaces, rules, and forwarding restoration. Successfully replacing installation files does not establish that old resources were removed; old state is not automatically claimed or migrated.
+
+Cross-file forwarding updates use an `ip_forward.pending` journal under the global lock, recording absolute target references, the original kernel setting, the instance state path, and namespace identity. Every reference operation first completes pending work by replaying target values, preventing retries after failed state writes from incrementing or decrementing twice. Ordinary state writes synchronize the committed membership flag under the same lock; journal replay changes only that flag, preserving newer DNS/rule ownership fields. Failed commits retain the journal and block later reference operations from bypassing it. This handles retryable write/system-call failures and does not promise durable recovery after power loss.
+
+Upgrades stop timers, then stop and wait for helper services including `activating` oneshots, then reread and stop the main service so refresh cancellation cannot restore it unnoticed. MicroSOCKS is built into a staged file and published only after shutdown. The installation lock uses a dedicated 0700 directory without changing system `/run/lock` permissions; host-global resources are no longer cleaned through interface-name compensation.
 
 ### Validation scope
 

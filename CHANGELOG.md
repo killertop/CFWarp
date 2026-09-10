@@ -2,6 +2,17 @@
 
 ## 2026-09-10
 
+### 发布前再次审查 / Additional pre-publish review
+
+- 修复升级漏停启动中的 oneshot：等待辅助服务退出后重新检查主服务，停服完成后才发布 MicroSOCKS；取消按接口名清理的升级补偿。
+- 安装锁使用专属受限目录，避免改变系统 `/run/lock` 权限。
+- 转发引用改为全局锁内的可重放事务，避免写入失败、跨实例操作和后续重试导致引用重复增减。
+- 严格验证 IPv6 Endpoint，跳过非法字面量，使有效备用候选仍能被尝试。
+- Fix upgrades missing activating oneshots: wait for helpers, reread the main service, and publish MicroSOCKS only after shutdown; remove name-only interface cleanup compensation.
+- Use a restricted installation-lock directory without changing system `/run/lock` permissions.
+- Journal forwarding-reference changes under the global lock so write failures, other instances, and retries cannot apply increments/decrements twice.
+- Validate IPv6 endpoints strictly and skip malformed literals so valid fallback candidates remain usable.
+
 ### 中文
 
 补充异常分支审查后，修复上一版测试未覆盖的锁失败、出口回落和恢复问题。

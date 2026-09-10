@@ -173,6 +173,20 @@ install_deps() {
     fi
 }
 
+CFWARP_BUILD_TMP=
+CFWARP_MICROSOCKS_STAGED=
+cleanup_install_temporary_files() {
+    CFWARP_INSTALL_EXIT_STATUS=$?
+    trap - EXIT HUP INT TERM
+    if [ -n "$CFWARP_BUILD_TMP" ]; then
+        rm -rf "$CFWARP_BUILD_TMP" || CFWARP_INSTALL_EXIT_STATUS=1
+    fi
+    if [ -n "$CFWARP_MICROSOCKS_STAGED" ]; then
+        rm -f "$CFWARP_MICROSOCKS_STAGED" || CFWARP_INSTALL_EXIT_STATUS=1
+    fi
+    exit "$CFWARP_INSTALL_EXIT_STATUS"
+}
+
 build_microsocks() {
     if [ "$SKIP_BUILD" = "1" ]; then
         if [ ! -x "${BIN_DIR}/microsocks" ]; then
@@ -185,22 +199,26 @@ build_microsocks() {
         echo "==> [ERROR] MICROSOCKS_COMMIT 必须是 40 位十六进制 commit。" >&2
         exit 1
     fi
-    TMP_DIR=$(mktemp -d)
-    cleanup_build() { rm -rf "$TMP_DIR"; }
-    trap 'cleanup_build' EXIT HUP INT TERM
-    git clone "$MICROSOCKS_REPO" "${TMP_DIR}/microsocks"
+    CFWARP_BUILD_TMP=$(mktemp -d)
+    CFWARP_MICROSOCKS_STAGED="${BIN_DIR}/.microsocks.new.$$"
+    git clone "$MICROSOCKS_REPO" "${CFWARP_BUILD_TMP}/microsocks"
     (
-        cd "${TMP_DIR}/microsocks"
+        cd "${CFWARP_BUILD_TMP}/microsocks"
         git checkout --detach "$MICROSOCKS_COMMIT"
         ACTUAL_COMMIT=$(git rev-parse HEAD)
         [ "$ACTUAL_COMMIT" = "$MICROSOCKS_COMMIT" ] || { echo "==> [ERROR] microsocks commit 校验失败。" >&2; exit 1; }
         make CFLAGS="$MICROSOCKS_CFLAGS"
         install -d "$BIN_DIR"
-        install -m 0755 microsocks "${BIN_DIR}/.microsocks.new.$$"
-        mv -f "${BIN_DIR}/.microsocks.new.$$" "${BIN_DIR}/microsocks"
+        install -m 0755 microsocks "$CFWARP_MICROSOCKS_STAGED"
     )
-    trap - EXIT HUP INT TERM
-    cleanup_build
+    rm -rf "$CFWARP_BUILD_TMP"
+    CFWARP_BUILD_TMP=
+}
+
+publish_microsocks() {
+    [ -n "$CFWARP_MICROSOCKS_STAGED" ] || return 0
+    mv -f "$CFWARP_MICROSOCKS_STAGED" "${BIN_DIR}/microsocks"
+    CFWARP_MICROSOCKS_STAGED=
 }
 
 install_private_wg_quick() {
@@ -316,7 +334,7 @@ cleanup_read_unit_state() {
     CFWARP_CLEAN_UNIT_RUNNING=1
     case "$CFWARP_CLEAN_ACTIVE_STATE" in
         inactive|failed) CFWARP_CLEAN_UNIT_RUNNING=0 ;;
-        '') echo "无法读取 $1 的运行状态，拒绝清理。" >&2; return 1 ;;
+        '') echo "无法读取 $1 的运行状态，拒绝修改安装。" >&2; return 1 ;;
     esac
 }
 
@@ -395,44 +413,78 @@ reload_and_enable() {
     done
 }
 
+stop_upgrade_unit() {
+    systemctl stop "$1" || return 1
+    cleanup_read_unit_state "$1" || return 1
+    if [ "$CFWARP_CLEAN_UNIT_RUNNING" = 1 ]; then
+        echo "$1 停止后仍处于 ${CFWARP_CLEAN_ACTIVE_STATE}，拒绝替换运行文件。" >&2
+        return 1
+    fi
+}
+
 stop_for_upgrade() {
     SERVICE_WAS_ACTIVE=0
     ACTIVE_TIMERS=
     systemd_available || return 0
-    systemctl is-active --quiet cfwarp.service && SERVICE_WAS_ACTIVE=1
     for CFWARP_TIMER in cfwarp-watchdog.timer cfwarp-endpoint-refresh.timer; do
-        if systemctl is-active --quiet "$CFWARP_TIMER"; then
+        cleanup_read_unit_state "$CFWARP_TIMER" || return 1
+        if [ "$CFWARP_CLEAN_UNIT_RUNNING" = 1 ]; then
             ACTIVE_TIMERS="${ACTIVE_TIMERS} $CFWARP_TIMER"
-            systemctl stop "$CFWARP_TIMER"
+            stop_upgrade_unit "$CFWARP_TIMER" || return 1
         fi
     done
     for CFWARP_UNIT in cfwarp-watchdog.service cfwarp-endpoint-refresh.service; do
-        if systemctl is-active --quiet "$CFWARP_UNIT"; then systemctl stop "$CFWARP_UNIT"; fi
-    done
-    if [ "$SERVICE_WAS_ACTIVE" = 1 ]; then
-        # Run the previous release cleanup before replacing its state reader.
-        systemctl stop cfwarp.service
-        if [ -f "$ENV_FILE" ] && [ "$(cfwarp_read_env_key CFWARP_MODE "$ENV_FILE" || true)" = host-global ]; then
-            CFWARP_OLD_IF=$(cfwarp_read_env_key WG_INTERFACE "$ENV_FILE" || true)
-            CFWARP_OLD_IF=${CFWARP_OLD_IF:-wg0}
-            cfwarp_validate_link_name "$CFWARP_OLD_IF" || exit 1
-            CFWARP_OLD_DATA=$(cfwarp_read_env_key CFWARP_DATA_DIR "$ENV_FILE" || true)
-            CFWARP_OLD_CONF_DIR=$(cfwarp_read_env_key WG_CONF_DIR "$ENV_FILE" || true)
-            CFWARP_OLD_CONF=$(cfwarp_read_env_key WG_CONF "$ENV_FILE" || true)
-            CFWARP_OLD_CONF=${CFWARP_OLD_CONF:-${CFWARP_OLD_CONF_DIR:-${CFWARP_OLD_DATA:-$DATA_DIR}}/${CFWARP_OLD_IF}.conf}
-            if wg show "$CFWARP_OLD_IF" >/dev/null 2>&1; then
-                # Compensate for the old release down-by-interface bug.
-                "${BIN_DIR}/wg-quick" down "$CFWARP_OLD_CONF"
-            fi
+        cleanup_read_unit_state "$CFWARP_UNIT" || return 1
+        if [ "$CFWARP_CLEAN_UNIT_RUNNING" = 1 ]; then
+            stop_upgrade_unit "$CFWARP_UNIT" || return 1
         fi
+    done
+    # A cancelled refresh may restore a main service it temporarily stopped.
+    # Read its state only after helper stop/cleanup has completed. ActiveState
+    # also covers activating/reloading/deactivating, unlike is-active.
+    cleanup_read_unit_state cfwarp.service || return 1
+    if [ "$CFWARP_CLEAN_UNIT_RUNNING" = 1 ]; then
+        SERVICE_WAS_ACTIVE=1
+        # Only the previous runtime may clean resources using its ownership
+        # records. A failed stop blocks upgrade; never compensate by name.
+        stop_upgrade_unit cfwarp.service || return 1
     fi
+    for CFWARP_UNIT in cfwarp.service cfwarp-watchdog.service cfwarp-endpoint-refresh.service; do
+        cleanup_read_unit_state "$CFWARP_UNIT" || return 1
+        if [ "$CFWARP_CLEAN_UNIT_RUNNING" = 1 ]; then
+            echo "$CFWARP_UNIT 尚未停止，拒绝替换运行文件。" >&2
+            return 1
+        fi
+    done
 }
 
 acquire_install_lock() {
-    command -v flock >/dev/null 2>&1 || { echo 'flock is required (util-linux).' >&2; exit 1; }
-    install -d -m 0755 /run/lock
-    exec 9>/run/lock/cfwarp-install.lock
-    flock -n 9 || { echo 'Another CFwarp installation is running.' >&2; exit 1; }
+    command -v flock >/dev/null 2>&1 || { echo 'flock is required (util-linux).' >&2; return 1; }
+    # Keep the private lock under root-owned /run. The shared /run/lock
+    # directory and its permissions must remain untouched.
+    CFWARP_INSTALL_LOCK_DIR=/run/cfwarp-install
+    if [ -L "$CFWARP_INSTALL_LOCK_DIR" ]; then
+        echo 'Installation lock directory must not be a symlink.' >&2
+        return 1
+    fi
+    if ! mkdir -m 0700 "$CFWARP_INSTALL_LOCK_DIR" 2>/dev/null; then
+        [ -d "$CFWARP_INSTALL_LOCK_DIR" ] && [ ! -L "$CFWARP_INSTALL_LOCK_DIR" ] || return 1
+    fi
+    CFWARP_INSTALL_LOCK_OWNER=$(stat -c '%u:%a' "$CFWARP_INSTALL_LOCK_DIR" 2>/dev/null || stat -f '%u:%Lp' "$CFWARP_INSTALL_LOCK_DIR") || return 1
+    if [ "$CFWARP_INSTALL_LOCK_OWNER" != "$(id -u):700" ]; then
+        echo 'Installation lock directory must be owned by the installer user with mode 0700.' >&2
+        return 1
+    fi
+    CFWARP_INSTALL_LOCK_FILE="${CFWARP_INSTALL_LOCK_DIR}/install.lock"
+    if [ -L "$CFWARP_INSTALL_LOCK_FILE" ] || { [ -e "$CFWARP_INSTALL_LOCK_FILE" ] && [ ! -f "$CFWARP_INSTALL_LOCK_FILE" ]; }; then
+        echo 'Installation lock must be a regular, non-symlink file.' >&2
+        return 1
+    fi
+    CFWARP_INSTALL_PREV_UMASK=$(umask)
+    umask 077
+    exec 9>>"$CFWARP_INSTALL_LOCK_FILE"
+    umask "$CFWARP_INSTALL_PREV_UMASK"
+    flock -n 9 || { echo 'Another CFwarp installation is running.' >&2; return 1; }
 }
 
 print_summary() {
@@ -478,8 +530,11 @@ if [ -f "$ENV_FILE" ]; then cfwarp_parse_env "$ENV_FILE" >/dev/null; fi
 for CFWARP_SOURCE_SCRIPT in "$SCRIPT_DIR"/*.sh "$SCRIPT_DIR/cfwarp-exec" "$SCRIPT_DIR/lib/cfwarp-common.sh"; do
     sh -n "$CFWARP_SOURCE_SCRIPT"
 done
+trap cleanup_install_temporary_files EXIT
+trap 'exit 143' HUP INT TERM
 build_microsocks
 stop_for_upgrade
+publish_microsocks
 install_private_wg_quick
 install_runtime_files
 reload_and_enable

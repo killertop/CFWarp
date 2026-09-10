@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unprivileged regressions for configuration, installation layout and CLI."""
 import os
+import ipaddress
 from pathlib import Path
 import shutil
 import subprocess
@@ -116,6 +117,24 @@ class Regression(unittest.TestCase):
         self.assertEqual(r.stdout, "192.0.2.41:2408\n")
         for endpoint in ("bad.invalid:2408", "missing.invalid:2408"):
             self.assertNotEqual(self.shell('cfwarp_resolve_endpoint "$1"', endpoint, env=env).returncode, 0)
+
+    def test_ipv6_candidates_match_standard_parser(self):
+        addresses = [
+            "::", "::1", "2001:db8::40", "1:2:3:4:5:6:7:8", "::ffff:192.0.2.1",
+            "1:2:3:4:5:6:192.0.2.1", "1:2:3:4:5::192.0.2.1",
+            "::::", "1::2::3", "1:2:3:4:5:6:7", "1:2:3:4:5:6:7:8:9",
+            "1:2:3:4:5:6:7:8::", "::1:2:3:4:5:6:7:8", "12345::1", "1:", ":1",
+            "::ffff:999.0.2.1", "::ffff:192.00.2.1", "192.0.2.1::", "::192.0.2",
+        ]
+        for address in addresses:
+            with self.subTest(address=address):
+                try:
+                    ipaddress.IPv6Address(address)
+                    valid = True
+                except ipaddress.AddressValueError:
+                    valid = False
+                r = self.shell('cfwarp_resolve_endpoint "$1"', f"[{address}]:2408")
+                self.assertEqual(r.returncode == 0, valid, r.stderr)
 
     def test_installed_doctor_uses_runtime_manifest(self):
         installed = self.base / "installed"

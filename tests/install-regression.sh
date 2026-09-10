@@ -106,6 +106,82 @@ assert_live_cleanup_refused
 test -x "$TMP_DIR/bin/cfwarp"
 test -e "$TMP_DIR/runtime/lib/cfwarp-common.sh"
 systemctl stop cfwarp.service cfwarp-watchdog.service cfwarp-endpoint-refresh.service
+
+# Exercise upgrade shutdown against real systemd transitions. The cancelled
+# oneshot's cleanup restores main, as an interrupted endpoint refresh does.
+# These are harmless sleep fixtures; no WARP API, interfaces, or routes run.
+mkdir "$TMP_DIR/upgrade-bin"
+printf 'old-binary\n' > "$TMP_DIR/upgrade-bin/microsocks"
+cp "$TMP_DIR/upgrade-bin/microsocks" "$TMP_DIR/old-binary"
+printf 'new-binary\n' > "$TMP_DIR/upgrade-bin/staged"
+: > "$TMP_DIR/upgrade-events"
+cat > "$TMP_DIR/refresh-cancelled.sh" <<EOF_REFRESH
+#!/bin/sh
+set -eu
+cmp '$TMP_DIR/upgrade-bin/microsocks' '$TMP_DIR/old-binary'
+systemctl start cfwarp.service
+printf 'restore-main\n' >> '$TMP_DIR/upgrade-events'
+EOF_REFRESH
+cat > "$TMP_DIR/main-stopped.sh" <<EOF_STOP
+#!/bin/sh
+set -eu
+cmp '$TMP_DIR/upgrade-bin/microsocks' '$TMP_DIR/old-binary'
+printf 'main-stopped\n' >> '$TMP_DIR/upgrade-events'
+EOF_STOP
+cat > "$TMP_DIR/systemd/cfwarp.service" <<EOF_MAIN
+[Unit]
+Description=CFwarp upgrade main fixture
+[Service]
+Type=simple
+ExecStart=/bin/sleep infinity
+ExecStopPost=/bin/sh $TMP_DIR/main-stopped.sh
+TimeoutStopSec=10
+EOF_MAIN
+cat > "$TMP_DIR/systemd/cfwarp-endpoint-refresh.service" <<EOF_HELPER
+[Unit]
+Description=CFwarp upgrade cancelled refresh fixture
+[Service]
+Type=oneshot
+ExecStart=/bin/sleep infinity
+ExecStopPost=/bin/sh $TMP_DIR/refresh-cancelled.sh
+TimeoutStartSec=0
+TimeoutStopSec=10
+EOF_HELPER
+systemctl daemon-reload
+systemctl start --no-block cfwarp-endpoint-refresh.service
+tries=0
+while [ "$(systemctl show --property=ActiveState --value cfwarp-endpoint-refresh.service)" != activating ] && [ "$tries" -lt 50 ]; do
+    sleep 0.1
+    tries=$((tries + 1))
+done
+test "$(systemctl show --property=ActiveState --value cfwarp-endpoint-refresh.service)" = activating
+test "$(systemctl show --property=ActiveState --value cfwarp.service)" = inactive
+awk '
+    /^publish_microsocks\(\)/ { capture=1 }
+    /^install_private_wg_quick\(\)/ { capture=0 }
+    /^cleanup_read_unit_state\(\)/ { capture=1 }
+    /^cleanup_preflight\(\)/ { capture=0 }
+    /^stop_upgrade_unit\(\)/ { capture=1 }
+    /^acquire_install_lock\(\)/ { capture=0 }
+    capture { print }
+' "$ROOT_DIR/install.sh" > "$TMP_DIR/live-upgrade-functions.sh"
+(
+    # shellcheck disable=SC1091
+    . "$TMP_DIR/live-upgrade-functions.sh"
+    systemd_available() { return 0; }
+    BIN_DIR="$TMP_DIR/upgrade-bin"
+    CFWARP_MICROSOCKS_STAGED="$TMP_DIR/upgrade-bin/staged"
+    stop_for_upgrade || exit 1
+    test "$SERVICE_WAS_ACTIVE" = 1 || exit 1
+    for unit in cfwarp.service cfwarp-watchdog.service cfwarp-endpoint-refresh.service cfwarp-watchdog.timer cfwarp-endpoint-refresh.timer; do
+        case "$(systemctl show --property=ActiveState --value "$unit")" in inactive|failed) ;; *) exit 1 ;; esac
+    done
+    cmp "$TMP_DIR/upgrade-bin/microsocks" "$TMP_DIR/old-binary" || exit 1
+    test "$(cat "$TMP_DIR/upgrade-events")" = "$(printf 'restore-main\nmain-stopped')" || exit 1
+    publish_microsocks || exit 1
+    test "$(cat "$TMP_DIR/upgrade-bin/microsocks")" = new-binary || exit 1
+    test ! -e "$TMP_DIR/upgrade-bin/staged" || exit 1
+) > "$TMP_DIR/upgrade.log" 2>&1 || { cat "$TMP_DIR/upgrade.log"; exit 1; }
 run_install --clean-generated > "$TMP_DIR/clean.log" 2>&1
 test -f "$TMP_DIR/env/cfwarp.env"
 test -d "$TMP_DIR/data"
