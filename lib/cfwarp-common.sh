@@ -201,6 +201,30 @@ cfwarp_validate_endpoint() {
     cfwarp_validate_port "$CFWARP_COMMON_PORT" endpoint >/dev/null 2>&1
 }
 
+# Resolve control-plane endpoints before entering the fail-closed namespace.
+# Domain endpoints use host IPv4 DNS; literal addresses never require DNS.
+cfwarp_resolve_endpoint() (
+    CFWARP_RESOLVE_ENDPOINT=$1
+    cfwarp_validate_endpoint "$CFWARP_RESOLVE_ENDPOINT" || return 1
+    case "$CFWARP_RESOLVE_ENDPOINT" in
+        \[*\]:*) printf '%s\n' "$CFWARP_RESOLVE_ENDPOINT"; return 0 ;;
+    esac
+    CFWARP_RESOLVE_HOST=${CFWARP_RESOLVE_ENDPOINT%:*}
+    CFWARP_RESOLVE_PORT=${CFWARP_RESOLVE_ENDPOINT##*:}
+    case "$CFWARP_RESOLVE_HOST" in
+        *[!0-9.]*)
+            command -v getent >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1 || return 1
+            CFWARP_RESOLVE_ANSWERS=$(timeout --kill-after=1 5 getent ahostsv4 "$CFWARP_RESOLVE_HOST" 2>/dev/null) || return 1
+            CFWARP_RESOLVE_HOST=$(printf '%s\n' "$CFWARP_RESOLVE_ANSWERS" | awk 'NF {print $1; exit}')
+            ;;
+    esac
+    printf '%s\n' "$CFWARP_RESOLVE_HOST" | awk -F. '
+        NF != 4 {exit 1}
+        {for (i=1;i<=4;i++) if ($i !~ /^[0-9]+$/ || $i>255 || (length($i)>1 && $i ~ /^0/)) exit 1}
+    ' || return 1
+    printf '%s:%s\n' "$CFWARP_RESOLVE_HOST" "$CFWARP_RESOLVE_PORT"
+)
+
 cfwarp_format_socks_proxy_url() {
     CFWARP_COMMON_HOST=$1
     CFWARP_COMMON_PORT=$2

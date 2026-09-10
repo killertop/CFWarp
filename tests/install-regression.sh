@@ -15,7 +15,7 @@ systemctl reset-failed cfwarp.service >/dev/null 2>&1 || true
 ROOT_DIR=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
 TMP_DIR=$(mktemp -d /tmp/cfwarp-install-test.XXXXXX)
 cleanup() {
-    if [ -e "$TMP_DIR/runtime/lib/cfwarp-common.sh" ]; then run_install --clean-generated >/dev/null 2>&1 || true; fi
+    if [ -e "$TMP_DIR/runtime/lib/cfwarp-common.sh" ]; then run_install --clean-generated --force >/dev/null 2>&1 || true; fi
     rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
@@ -45,6 +45,67 @@ systemd-analyze verify "$TMP_DIR/systemd/"*.service "$TMP_DIR/systemd/"*.timer
 if run_install --data-dir "$TMP_DIR/space path" > "$TMP_DIR/invalid.log" 2>&1; then
     echo 'installer accepted an unsupported path' >&2; exit 1
 fi
+
+# Use harmless live units to check that a rejected cleanup does not stop the
+# watchdog, refresh, timers, or main service. No WARP/network setup is involved.
+for unit in cfwarp.service cfwarp-watchdog.service cfwarp-endpoint-refresh.service; do
+    case "$unit" in cfwarp.service) unit_type=simple ;; *) unit_type=oneshot ;; esac
+    cat > "$TMP_DIR/systemd/$unit" <<EOF_SERVICE
+[Unit]
+Description=CFwarp installation refusal test fixture
+[Service]
+Type=$unit_type
+ExecStart=/bin/sleep infinity
+TimeoutStartSec=0
+TimeoutStopSec=5
+[Install]
+WantedBy=multi-user.target
+EOF_SERVICE
+done
+for timer in cfwarp-watchdog cfwarp-endpoint-refresh; do
+    cat > "$TMP_DIR/systemd/$timer.timer" <<EOF_TIMER
+[Unit]
+Description=CFwarp installation refusal timer fixture
+[Timer]
+OnActiveSec=1h
+Unit=$timer.service
+[Install]
+WantedBy=timers.target
+EOF_TIMER
+done
+systemctl daemon-reload
+systemctl start --no-block cfwarp.service cfwarp-watchdog.service cfwarp-endpoint-refresh.service
+systemctl enable --now cfwarp-watchdog.timer cfwarp-endpoint-refresh.timer
+for unit in cfwarp.service cfwarp-watchdog.service cfwarp-endpoint-refresh.service; do
+    case "$unit" in cfwarp.service) expected_state=active ;; *) expected_state=activating ;; esac
+    tries=0
+    while [ "$(systemctl show --property=ActiveState --value "$unit")" != "$expected_state" ] && [ "$tries" -lt 50 ]; do
+        sleep 0.1
+        tries=$((tries + 1))
+    done
+    test "$(systemctl show --property=ActiveState --value "$unit")" = "$expected_state"
+done
+assert_live_cleanup_refused() {
+    for unit in cfwarp.service cfwarp-watchdog.service cfwarp-endpoint-refresh.service cfwarp-watchdog.timer cfwarp-endpoint-refresh.timer; do
+        systemctl show --property=ActiveState --property=UnitFileState "$unit" > "$TMP_DIR/$unit.before"
+    done
+    if run_install --clean-generated > "$TMP_DIR/refusal.log" 2>&1; then
+        echo 'installer accepted cleanup of a running service without --force' >&2; exit 1
+    fi
+    for unit in cfwarp.service cfwarp-watchdog.service cfwarp-endpoint-refresh.service cfwarp-watchdog.timer cfwarp-endpoint-refresh.timer; do
+        systemctl show --property=ActiveState --property=UnitFileState "$unit" > "$TMP_DIR/$unit.after"
+        cmp "$TMP_DIR/$unit.before" "$TMP_DIR/$unit.after"
+    done
+}
+assert_live_cleanup_refused
+# Refresh is a live oneshot (activating), even though is-active returns false
+# and the main service is stopped while an endpoint refresh runs.
+systemctl stop cfwarp.service cfwarp-watchdog.service
+test "$(systemctl show --property=ActiveState --value cfwarp-endpoint-refresh.service)" = activating
+assert_live_cleanup_refused
+test -x "$TMP_DIR/bin/cfwarp"
+test -e "$TMP_DIR/runtime/lib/cfwarp-common.sh"
+systemctl stop cfwarp.service cfwarp-watchdog.service cfwarp-endpoint-refresh.service
 run_install --clean-generated > "$TMP_DIR/clean.log" 2>&1
 test -f "$TMP_DIR/env/cfwarp.env"
 test -d "$TMP_DIR/data"

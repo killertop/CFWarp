@@ -43,9 +43,7 @@ if [ "$CFWARP_MODE" != "netns-proxy" ]; then
     echo "不支持的 CFWARP_MODE: $CFWARP_MODE" >&2
     exit 1
 fi
-if ! ip netns list 2>/dev/null | awk '{print $1}' | grep -Fx "$NETNS_NAME" >/dev/null 2>&1; then
-    echo "找不到 network namespace \"$NETNS_NAME\"。请先启动 cfwarp.service。" >&2
-    exit 1
-fi
-
-exec ip netns exec "$NETNS_NAME" "$@"
+# The helper holds the namespace ownership lock through validation and entry,
+# then releases it inside that namespace. Its kernel egress guard survives
+# tunnel loss and remains effective for already-running commands.
+exec sh "${SCRIPT_DIR}/cfwarp-netns.sh" exec "$@"

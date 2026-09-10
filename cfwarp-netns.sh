@@ -29,6 +29,9 @@ WG_CONF_DIR=${WG_CONF_DIR:-$CFWARP_DATA_DIR}
 WG_CONF=${WG_CONF:-${WG_CONF_DIR}/${WG_INTERFACE}.conf}
 WG_QUICK_BIN=${WG_QUICK_BIN:-${SCRIPT_DIR}/bin/wg-quick}
 IPTABLES_WAIT_SECONDS=${IPTABLES_WAIT_SECONDS:-5}
+CFWARP_WG_FWMARK=${CFWARP_WG_FWMARK:-51820}
+BIND_PORT=${BIND_PORT:-1080}
+EGRESS_CHAIN=CFWARP_EGRESS
 CFWARP_LOCK_WAIT_SECONDS=${CFWARP_LOCK_WAIT_SECONDS:-30}
 IP_FORWARD_PREV_FILE="${CFWARP_GLOBAL_STATE_DIR}/ip_forward.prev"
 IP_FORWARD_REF_FILE="${CFWARP_GLOBAL_STATE_DIR}/ip_forward.refs"
@@ -44,6 +47,7 @@ CFWARP_HOST_INDEX=
 CFWARP_DNS_CREATED=0
 CFWARP_DNS_INODE=
 CFWARP_RULES_STARTED=0
+CFWARP_EGRESS_GUARD_VERSION=0
 
 fail() { echo "==> [ERROR] $*" >&2; return 1; }
 
@@ -53,6 +57,8 @@ validate_config() {
     cfwarp_validate_link_name "$NETNS_NS_IF" NETNS_NS_IF || return 1
     cfwarp_validate_link_name "$WG_INTERFACE" WG_INTERFACE || return 1
     [ "$NETNS_HOST_IF" != "$NETNS_NS_IF" ] || { fail 'veth 两端名称必须不同。'; return 1; }
+    cfwarp_validate_uint "$CFWARP_WG_FWMARK" CFWARP_WG_FWMARK 1 2147483647 || return 1
+    cfwarp_validate_port "$BIND_PORT" BIND_PORT || return 1
     cfwarp_validate_uint "$IPTABLES_WAIT_SECONDS" IPTABLES_WAIT_SECONDS 0 60 || return 1
     cfwarp_validate_uint "$CFWARP_LOCK_WAIT_SECONDS" CFWARP_LOCK_WAIT_SECONDS 1 600 || return 1
     for CFWARP_ADDRESS in "$NETNS_HOST_ADDR" "$NETNS_PEER_ADDR" "$NETNS_CIDR"; do
@@ -127,7 +133,11 @@ request_signal() {
 lock_ip_forward_state() {
     [ "$CFWARP_FORWARD_LOCKED" -eq 0 ] || return 0
     exec 9> "$IP_FORWARD_LOCK_FILE"
-    flock -w "$CFWARP_LOCK_WAIT_SECONDS" 9 || fail '等待 ip_forward 状态锁超时。'
+    if ! flock -w "$CFWARP_LOCK_WAIT_SECONDS" 9; then
+        exec 9>&-
+        fail '等待 ip_forward 状态锁超时。'
+        return 1
+    fi
     CFWARP_FORWARD_LOCKED=1
 }
 
@@ -143,20 +153,22 @@ read_ref_count() {
 }
 
 acquire_ip_forward_ref() {
-    lock_ip_forward_state
-    read_ref_count
+    # Every failure returns explicitly: callers may use if/||, which disables
+    # errexit throughout a shell function's call tree.
+    lock_ip_forward_state || return 1
+    read_ref_count || return 1
     if [ "$CFWARP_REF_COUNT" -eq 0 ]; then
-        CFWARP_CURRENT_FORWARD=$(sysctl -n net.ipv4.ip_forward)
-        case "$CFWARP_CURRENT_FORWARD" in 0|1) ;; *) fail '无法读取 ip_forward。' ;; esac
-        printf '%s\n' "$CFWARP_CURRENT_FORWARD" | cfwarp_atomic_write_from_stdin "$IP_FORWARD_PREV_FILE"
+        CFWARP_CURRENT_FORWARD=$(sysctl -n net.ipv4.ip_forward) || return 1
+        case "$CFWARP_CURRENT_FORWARD" in 0|1) ;; *) fail '无法读取 ip_forward。'; return 1 ;; esac
+        printf '%s\n' "$CFWARP_CURRENT_FORWARD" | cfwarp_atomic_write_from_stdin "$IP_FORWARD_PREV_FILE" || return 1
     fi
     CFWARP_REF_COUNT=$((CFWARP_REF_COUNT + 1))
-    printf '%s\n' "$CFWARP_REF_COUNT" | cfwarp_atomic_write_from_stdin "$IP_FORWARD_REF_FILE"
+    printf '%s\n' "$CFWARP_REF_COUNT" | cfwarp_atomic_write_from_stdin "$IP_FORWARD_REF_FILE" || return 1
     IP_FORWARD_REF_HELD=1
     # Kernel mutation and reference bookkeeping share the same kernel lock.
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null
-    write_state_file
-    unlock_ip_forward_state
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null || return 1
+    write_state_file || return 1
+    unlock_ip_forward_state || return 1
     check_signal
 }
 
@@ -190,6 +202,9 @@ NETNS_CIDR=$NETNS_CIDR
 NETNS_OUT_IF=$NETNS_OUT_IF
 WG_INTERFACE=$WG_INTERFACE
 WG_CONF=$WG_CONF
+WG_FWMARK=$CFWARP_WG_FWMARK
+BIND_PORT=$BIND_PORT
+EGRESS_GUARD_VERSION=$CFWARP_EGRESS_GUARD_VERSION
 NS_INODE=$CFWARP_NS_INODE
 HOST_INDEX=$CFWARP_HOST_INDEX
 DNS_CREATED=$CFWARP_DNS_CREATED
@@ -216,6 +231,12 @@ load_state() {
     NETNS_OUT_IF=$(state_value NETNS_OUT_IF)
     WG_INTERFACE=$(state_value WG_INTERFACE)
     WG_CONF=$(state_value WG_CONF)
+    CFWARP_WG_FWMARK=$(state_value WG_FWMARK)
+    CFWARP_WG_FWMARK=${CFWARP_WG_FWMARK:-51820}
+    BIND_PORT=$(state_value BIND_PORT)
+    BIND_PORT=${BIND_PORT:-1080}
+    CFWARP_EGRESS_GUARD_VERSION=$(state_value EGRESS_GUARD_VERSION)
+    CFWARP_EGRESS_GUARD_VERSION=${CFWARP_EGRESS_GUARD_VERSION:-0}
     CFWARP_NS_INODE=$(state_value NS_INODE)
     CFWARP_HOST_INDEX=$(state_value HOST_INDEX)
     CFWARP_DNS_CREATED=$(state_value DNS_CREATED)
@@ -243,6 +264,68 @@ write_netns_resolv_conf() {
         done
     } | cfwarp_atomic_write_from_stdin "${RESOLV_DIR}/resolv.conf"
     chmod 0644 "${RESOLV_DIR}/resolv.conf"
+}
+
+netns_firewall_cmd() {
+    CFWARP_NETNS_FIREWALL=$1
+    shift
+    ip netns exec "$NETNS_NAME" "$CFWARP_NETNS_FIREWALL" -w "$IPTABLES_WAIT_SECONDS" "$@"
+}
+
+install_egress_guard() {
+    # No veth or external route exists yet. Install both families before the
+    # namespace gains connectivity, and retain these rules until it is deleted.
+    for CFWARP_NETNS_FIREWALL in iptables ip6tables; do
+        netns_firewall_cmd "$CFWARP_NETNS_FIREWALL" -P OUTPUT DROP || return 1
+        netns_firewall_cmd "$CFWARP_NETNS_FIREWALL" -P FORWARD DROP || return 1
+        netns_firewall_cmd "$CFWARP_NETNS_FIREWALL" -N "$EGRESS_CHAIN" || return 1
+        netns_firewall_cmd "$CFWARP_NETNS_FIREWALL" -A "$EGRESS_CHAIN" -o lo -j ACCEPT || return 1
+        netns_firewall_cmd "$CFWARP_NETNS_FIREWALL" -A "$EGRESS_CHAIN" -o "$WG_INTERFACE" -j ACCEPT || return 1
+        netns_firewall_cmd "$CFWARP_NETNS_FIREWALL" -A "$EGRESS_CHAIN" -o "$NETNS_NS_IF" -p udp -m mark --mark "$CFWARP_WG_FWMARK" -j ACCEPT || return 1
+        netns_firewall_cmd "$CFWARP_NETNS_FIREWALL" -A "$EGRESS_CHAIN" -o "$NETNS_NS_IF" -p tcp --sport "$BIND_PORT" -m conntrack --ctstate ESTABLISHED --ctdir REPLY -j ACCEPT || return 1
+        netns_firewall_cmd "$CFWARP_NETNS_FIREWALL" -A "$EGRESS_CHAIN" -j DROP || return 1
+        netns_firewall_cmd "$CFWARP_NETNS_FIREWALL" -I OUTPUT 1 -j "$EGRESS_CHAIN" || return 1
+    done
+    CFWARP_EGRESS_GUARD_VERSION=1
+    write_state_file
+}
+
+check_egress_guard() {
+    [ "$CFWARP_EGRESS_GUARD_VERSION" = 1 ] || return 1
+    for CFWARP_NETNS_FIREWALL in iptables ip6tables; do
+        CFWARP_GUARD_OUTPUT=$(netns_firewall_cmd "$CFWARP_NETNS_FIREWALL" -S OUTPUT) || return 1
+        [ "$(printf '%s\n' "$CFWARP_GUARD_OUTPUT" | head -n 2)" = "-P OUTPUT DROP
+-A OUTPUT -j $EGRESS_CHAIN" ] || return 1
+        CFWARP_GUARD_FORWARD=$(netns_firewall_cmd "$CFWARP_NETNS_FIREWALL" -S FORWARD) || return 1
+        [ "$CFWARP_GUARD_FORWARD" = '-P FORWARD DROP' ] || return 1
+        CFWARP_GUARD_RULES=$(netns_firewall_cmd "$CFWARP_NETNS_FIREWALL" -S "$EGRESS_CHAIN") || return 1
+        [ "$(printf '%s\n' "$CFWARP_GUARD_RULES" | awk '$1=="-A" {n++} END {print n+0}')" -eq 5 ] || return 1
+        [ "$(printf '%s\n' "$CFWARP_GUARD_RULES" | tail -n 1)" = "-A $EGRESS_CHAIN -j DROP" ] || return 1
+        netns_firewall_cmd "$CFWARP_NETNS_FIREWALL" -C "$EGRESS_CHAIN" -o lo -j ACCEPT || return 1
+        netns_firewall_cmd "$CFWARP_NETNS_FIREWALL" -C "$EGRESS_CHAIN" -o "$WG_INTERFACE" -j ACCEPT || return 1
+        netns_firewall_cmd "$CFWARP_NETNS_FIREWALL" -C "$EGRESS_CHAIN" -o "$NETNS_NS_IF" -p udp -m mark --mark "$CFWARP_WG_FWMARK" -j ACCEPT || return 1
+        netns_firewall_cmd "$CFWARP_NETNS_FIREWALL" -C "$EGRESS_CHAIN" -o "$NETNS_NS_IF" -p tcp --sport "$BIND_PORT" -m conntrack --ctstate ESTABLISHED --ctdir REPLY -j ACCEPT || return 1
+    done
+}
+
+check_namespace_ready() {
+    load_state || return 1
+    [ -n "$CFWARP_NS_INODE" ] && [ "$(namespace_inode)" = "$CFWARP_NS_INODE" ] || {
+        fail 'namespace 缺少有效的资源归属记录。'; return 1;
+    }
+    check_egress_guard || { fail 'namespace 出口保护未就绪。'; return 1; }
+    CFWARP_LIVE_MARK=$(ip netns exec "$NETNS_NAME" wg show "$WG_INTERFACE" fwmark 2>/dev/null) || return 1
+    CFWARP_LIVE_MARK=$(printf '%d' "$CFWARP_LIVE_MARK" 2>/dev/null) || return 1
+    [ "$CFWARP_LIVE_MARK" = "$CFWARP_WG_FWMARK" ] || { fail 'WireGuard transport 标记不匹配。'; return 1; }
+    CFWARP_EXEC_MAX_HANDSHAKE_AGE_SECONDS=${CFWARP_EXEC_MAX_HANDSHAKE_AGE_SECONDS:-180}
+    cfwarp_validate_uint "$CFWARP_EXEC_MAX_HANDSHAKE_AGE_SECONDS" CFWARP_EXEC_MAX_HANDSHAKE_AGE_SECONDS 1 86400 || return 1
+    CFWARP_HANDSHAKES=$(ip netns exec "$NETNS_NAME" wg show "$WG_INTERFACE" latest-handshakes 2>/dev/null) || return 1
+    printf '%s\n' "$CFWARP_HANDSHAKES" | awk -v now="$(date +%s)" -v age="$CFWARP_EXEC_MAX_HANDSHAKE_AGE_SECONDS" '
+        $2 ~ /^[0-9]+$/ && $2>0 && now-$2>=0 && now-$2<=age {ready=1}
+        END {exit !ready}' || { fail 'WireGuard 尚无近期成功握手。'; return 1; }
+    ip netns exec "$NETNS_NAME" ip -4 route get 1.1.1.1 | awk -v iface="$WG_INTERFACE" '
+        {for(i=1;i<NF;i++) if($i=="dev" && $(i+1)==iface) found=1}
+        END {exit !found}' || { fail 'WireGuard 默认出口路由未就绪。'; return 1; }
 }
 
 teardown() {
@@ -320,6 +403,7 @@ setup() {
     CFWARP_NS_INODE=$(namespace_inode)
     [ -n "$CFWARP_NS_INODE" ] || fail '无法记录 namespace 所有权。'
     write_state_file
+    install_egress_guard
     check_signal
     mkdir "$RESOLV_DIR"
     CFWARP_DNS_CREATED=1
@@ -359,11 +443,11 @@ cleanup_exit() {
     exit "$CFWARP_EXIT_STATUS"
 }
 
-case "$ACTION" in up|down) ;; *) echo "用法: $0 {up|down}" >&2; exit 1 ;; esac
+case "$ACTION" in up|down|check|exec) ;; *) echo "用法: $0 {up|down|check|exec COMMAND...}" >&2; exit 1 ;; esac
 case "$CFWARP_MODE" in host-global) exit 0 ;; netns-proxy) ;; *) fail "不支持的 CFWARP_MODE: $CFWARP_MODE"; exit 1 ;; esac
 validate_config
 [ "$(id -u)" -eq 0 ] || { fail 'cfwarp-netns.sh 需要 root 权限。'; exit 1; }
-for CFWARP_COMMAND in ip iptables sysctl flock; do
+for CFWARP_COMMAND in ip iptables ip6tables sysctl flock; do
     command -v "$CFWARP_COMMAND" >/dev/null 2>&1 || { fail "缺少命令: $CFWARP_COMMAND"; exit 1; }
 done
 install -d -m 0700 "$CFWARP_STATE_DIR" "$CFWARP_GLOBAL_STATE_DIR"
@@ -379,5 +463,16 @@ trap 'request_signal 143' TERM
 case "$ACTION" in
     up) setup; check_signal ;;
     down) teardown; check_signal ;;
+    check) check_namespace_ready ;;
+    exec)
+        shift
+        [ "$#" -gt 0 ] || { fail 'exec 需要命令。'; exit 1; }
+        check_namespace_ready
+        # Keep the name/ownership lock through setns, then release it inside
+        # the selected kernel namespace before running a long-lived command.
+        # Later teardown may delete the name; this process retains the guarded
+        # namespace itself and can never follow a replacement with that name.
+        exec ip netns exec "$NETNS_NAME" sh -c 'exec 8>&-; exec "$@"' cfwarp-exec "$@"
+        ;;
 esac
 trap - EXIT HUP INT TERM

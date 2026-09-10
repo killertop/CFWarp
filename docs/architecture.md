@@ -1,6 +1,6 @@
 # 架构决定与验证范围 / Architecture decisions and validation scope
 
-日期 / Date: 2026-09-09
+日期 / Date: 2026-09-10
 
 ## 中文
 
@@ -28,6 +28,16 @@ CFWarp 的控制层负责安装、配置、进程、网络资源和恢复；数�
 | 诊断和扫描 | 安装态检查真实运行文件；重试参数不被旧配置覆盖；扫描异常属于失败。 |
 
 配置目录、数据目录和安装记录应由 root 控制。资源归属检查防止意外接管和清理，不构成对恶意 root 的安全隔离。namespace 隔离代理流量，默认模式仍需要本项目的 host veth、NAT/转发规则及 forwarding 状态；“不改宿主机默认路由”不等于“完全不改变宿主机网络状态”。
+
+### 故障时阻止直连
+
+默认 namespace 在 veth 或默认路由可用前，对 IPv4 和 IPv6 的 OUTPUT/FORWARD 设置默认拒绝。只放行 loopback、经 WireGuard 接口的流量、经 veth 且带匹配 WireGuard fwmark 的 UDP 加密传输，以及 SOCKS 监听端口上 conntrack 判定为 REPLY 的已建立 TCP 返回流量。不提供通用 ESTABLISHED 放行或直连 DNS 例外；接口消失、路由丢失或退出清理时保护仍生效。
+
+`cfwarp-start.sh` 先在宿主机运行仅准备阶段，初始化账户/profile 并解析候选，随后把原候选与数字地址映射传给 namespace 中的入口。首次 `wg-quick up` 使用已解析的候选，所以无效旧域名不会阻止备用 IP 被尝试。准备阶段和运行阶段都受进程组监督。`CFWARP_WG_FWMARK` 默认 51820，在 namespace/probe 配置和防火墙中保持一致。
+
+`cfwarp-exec` 检查资源归属、出口规则、fwmark、近期握手与路由后再执行命令；检查后的持续保护由内核规则承担。此保护适用于受管理的 namespace，不能防止具有 root/网络管理能力的程序主动改变规则或标记流量；`host-global` 没有加入宿主机全局出口阻断。
+
+Endpoint 刷新开始前把原配置放入数据目录下独立、受限权限的持久恢复目录。部署验证、回滚或资源清理失败时保留；恢复写入失败不会继续启动部分恢复的配置。安装清理在锁前和锁后都执行只读拒绝检查，明确允许后才停止服务和定时器。
 
 ### systemd 与升级边界
 
@@ -81,6 +91,16 @@ If control-layer complexity, persistent scheduling, or observability needs grow,
 | Diagnostics and scans | Check the actual installed runtime files; preserve retry overrides; treat scanner errors as failures. |
 
 Root must control configuration, data, and installation records. Ownership checks prevent accidental takeover and cleanup; they are not a security boundary against malicious root. The namespace isolates proxy traffic, but default setup still requires host veth devices, project-owned NAT/forwarding rules, and forwarding state. Preserving the host default route does not mean making no changes to host networking.
+
+### Blocking direct fallback on failure
+
+Before veth connectivity or a default route is available, default namespace mode sets IPv4 and IPv6 OUTPUT/FORWARD policies to DROP. Exceptions cover loopback, traffic through the WireGuard interface, encrypted UDP transport over veth carrying the matching WireGuard fwmark, and established TCP replies from the SOCKS listening port whose conntrack direction is REPLY. There is no general ESTABLISHED allowance or direct DNS exception. Protection remains effective when interfaces or routes disappear and during cleanup.
+
+`cfwarp-start.sh` first runs a host preparation phase to initialize the account/profile and resolve candidates, then passes original-candidate/literal-address mappings to the namespace entry point. The first `wg-quick up` uses a resolved candidate, so an invalid old hostname cannot prevent backup IP candidates from being tried. Process-group supervision covers both preparation and runtime. `CFWARP_WG_FWMARK` defaults to 51820 and is kept consistent between namespace/probe configuration and firewall rules.
+
+`cfwarp-exec` checks ownership, egress rules, fwmark, recent handshakes, and routing before executing a command. Kernel rules provide continuous protection after those checks. This applies to managed namespaces; programs with root/network-management capabilities can deliberately alter rules or mark traffic. No host-wide kill switch is added to `host-global`.
+
+Endpoint refresh saves originals in a separate persistent recovery directory with restricted permissions before making changes. Deployment verification, rollback, or resource-cleanup failure retains that directory; failed restoration does not start a partially restored configuration. Installation cleanup performs read-only refusal checks both before and after the lock, stopping services and timers only after those checks permit cleanup.
 
 ### systemd and upgrade boundaries
 

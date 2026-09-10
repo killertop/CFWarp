@@ -11,7 +11,7 @@ fi
     echo 'ERROR: --live requires root in an isolated Linux VM.' >&2
     exit 1
 }
-for tool in ip iptables sysctl flock curl; do command -v "$tool" >/dev/null; done
+for tool in ip iptables ip6tables sysctl flock curl; do command -v "$tool" >/dev/null; done
 TMP_DIR=$(mktemp -d /tmp/cfwarp-net-test.XXXXXX)
 TEST_TAG=cft$$
 REAL_IP=$(command -v ip)
@@ -303,6 +303,7 @@ cp "$ROOT_DIR/cfwarp-start.sh" "$ROOT_DIR/cfwarp-netns.sh" "$TMP_DIR/service/"
 cp "$ROOT_DIR/lib/cfwarp-common.sh" "$TMP_DIR/service/lib/"
 cat > "$TMP_DIR/service/entrypoint.sh" <<'STUB'
 #!/bin/sh
+[ "${CFWARP_PREPARE_ONLY:-0}" != 1 ] || exit 0
 sleep 60 &
 SLEEP_PID=$!
 finish() {

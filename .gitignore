@@ -3,6 +3,7 @@
 *~
 *.swp
 *.swo
+__pycache__/
 
 # Runtime state, credentials and locally built artifacts
 /bin/

@@ -72,9 +72,11 @@ ALL_PROXY=socks5h://169.254.240.2:1080 curl https://www.cloudflare.com/cdn-cgi/t
 sudo /opt/cfwarp/cfwarp-exec curl https://www.cloudflare.com/cdn-cgi/trace
 ```
 
-这需要 root 权限，命令也以 root 运行；服务未启动或当前是 `host-global` 模式时无法使用。当前 WARP 出站限于 IPv4，SOCKS5 仅转发 TCP，不提供 UDP 代理。
+这需要 root 权限，命令也以 root 运行；服务未启动、namespace 归属或出口保护不匹配、隧道没有近期握手或路由尚未就绪时会拒绝执行，`host-global` 模式也无法使用。当前 WARP 出站限于 IPv4，SOCKS5 仅转发 TCP，不提供 UDP 代理。
 
 默认不会替换宿主机默认路由，但会创建 veth 和本项目的 NAT/转发规则，并在需要时启用 IPv4 forwarding。停止时按记录的资源归属清理；同名外部资源不应被当作可接管资源。
+
+namespace 的出口防火墙在建立连通性前生效。隧道接口或路由消失时，新请求会失败，不会经宿主机直接出站；健康守护随后可以尝试恢复服务。此保护依赖内核防火墙，不依赖健康检查的轮询间隔。
 
 ### 4. DNS 与认证
 
@@ -85,6 +87,8 @@ NETNS_DNS_SERVERS="1.1.1.1 1.0.0.1"
 ```
 
 可配置空格分隔的 IPv4 DNS 服务器，所选服务器需要能从 namespace 的网络路径访问。默认不复制宿主机私网/VPC DNS，避免 WARP 默认路由将私网解析请求送往不可达出口。依赖内部域名的应用需要另行设计解析和路由；填写宿主机私网 DNS 地址并不自动建立可达路径。
+
+账户下载/初始化和隧道 Endpoint 的初始域名解析在宿主机完成。域名候选需要宿主机的 `getent` 与 `timeout`，优先解析为 IPv4；解析失败会继续尝试备用候选。应用 DNS 没有直连例外，隧道断开时也会被阻断。
 
 通过 SOCKS5 使用认证时，在私有环境文件同时设置：
 
@@ -105,6 +109,8 @@ BIND_ADDR=127.0.0.1
 ```
 
 然后重启服务。此模式由 `wg-quick` 在宿主机处理 IPv4 路由，可能改变远程管理和现有服务的流量路径。切换前应保留可恢复服务器网络的访问方式。无认证监听通配地址会被拒绝；即使启用认证，也应通过宿主机防火墙限制访问。
+
+`host-global` 不提供 namespace 模式的故障出口阻断；需要“隧道故障时阻止直连”的应用应使用默认 namespace 模式。
 
 ### 6. 服务、健康检查与诊断
 
@@ -159,6 +165,8 @@ CFWARP_ENDPOINT_REFRESH_ACTIVE_MODE=stop-and-probe
 
 探测复用同一 WireGuard 身份并串行运行，避免多个探测隧道相互影响。每个候选受超时控制，退出时终止探测再清理其资源。当前 Endpoint 健康时，仅在达到改善阈值后切换；当前 Endpoint 不可用时，可以选择已验证可用的候选。恢复服务失败时尝试回滚原配置。测量只用于当时的候选比较，不证明长期带宽或稳定性。
 
+若切换验证、配置恢复或探测资源清理失败，原配置、日志与 `RECOVERY.txt` 保留在数据目录的 `recovery/endpoint-refresh-*` 中（默认 `/var/lib/cfwarp/recovery`）。目录权限 0700，文件权限 0600；日志会给出具体路径。恢复不完整时不自动启动半恢复的配置。按说明恢复并验证后再删除该次目录；备份包含凭证，不能公开或当作 Shell 脚本执行。
+
 手动触发与查看日志：
 
 ```bash
@@ -186,6 +194,8 @@ sudo ./install.sh --clean-generated
 ```
 
 私有环境文件和 WARP 数据保留，便于恢复或另行处理。先处理停止失败，再进行文件清理；删除运行文件不等于已经清除了内核网络资源。
+
+没有 `--force` 时，主服务、watchdog 或 Endpoint 刷新服务仍在运行都会拒绝清理，保留其状态与定时器；检查也会在取得安装锁后重复，避免等待锁期间状态改变。
 
 ## English
 
@@ -257,9 +267,11 @@ Commands without a proxy option can run inside the namespace:
 sudo /opt/cfwarp/cfwarp-exec curl https://www.cloudflare.com/cdn-cgi/trace
 ```
 
-This requires root and runs the command as root. It is unavailable when the namespace is absent or `host-global` is selected. Current WARP egress is IPv4 only; SOCKS5 forwards TCP and does not provide UDP proxying.
+This requires root and runs the command as root. Execution is refused if the namespace is absent, ownership or egress protection does not match, or the tunnel lacks a recent handshake or a ready route. It is also unavailable in `host-global` mode. Current WARP egress is IPv4 only; SOCKS5 forwards TCP and does not provide UDP proxying.
 
 The default mode preserves the host default route but creates veth devices and project-owned NAT/forwarding rules, enabling IPv4 forwarding when needed. Shutdown uses recorded ownership for cleanup; existing external resources with matching names must not be treated as available for takeover.
+
+The namespace egress firewall is installed before connectivity is established. If the tunnel interface or routes disappear, new requests fail instead of leaving directly through the host; the watchdog can subsequently attempt recovery. This protection relies on the kernel firewall rather than the health-check polling interval.
 
 ### 4. DNS and authentication
 
@@ -270,6 +282,8 @@ NETNS_DNS_SERVERS="1.1.1.1 1.0.0.1"
 ```
 
 You can specify space-separated IPv4 DNS servers that are reachable through the namespace's network path. Host private/VPC resolvers are not copied by default, because WARP's default route can send private DNS requests to an unreachable destination. Applications requiring internal domains need a separate DNS/routing design; entering a private resolver address does not create a route to it.
+
+Account downloads/initialization and initial tunnel-endpoint DNS resolution run on the host. Domain candidates require host `getent` and `timeout`, resolving to IPv4; failed resolution falls through to backup candidates. Application DNS has no direct-egress exception and is blocked when the tunnel is unavailable.
 
 To enable SOCKS5 authentication, set both values in the private configuration:
 
@@ -290,6 +304,8 @@ BIND_ADDR=127.0.0.1
 ```
 
 Restart the service afterward. `wg-quick` manages IPv4 routing on the host in this mode, which can change the traffic path for remote administration and existing services. Keep a way to recover server networking before switching. Unauthenticated wildcard listeners are rejected; restrict access with the host firewall even when authentication is enabled.
+
+`host-global` does not provide namespace mode's fail-closed protection. Use default namespace mode for applications that must block direct egress when the tunnel fails.
 
 ### 6. Service management and diagnostics
 
@@ -344,6 +360,8 @@ CFWARP_ENDPOINT_REFRESH_ACTIVE_MODE=stop-and-probe
 
 Probes reuse one WireGuard identity and run sequentially to avoid interfering with each other. Candidates have bounded execution time; shutdown stops probing before cleaning resources. When the current endpoint is healthy, switching requires the improvement threshold to be met. When it is unavailable, a verified working candidate may be selected. If service recovery fails, refresh attempts to restore the old configuration. Measurements compare candidates at that time; they do not establish long-term bandwidth or reliability.
 
+If switch verification, configuration restoration, or probe cleanup fails, originals, logs, and `RECOVERY.txt` remain in `recovery/endpoint-refresh-*` under the data directory (default `/var/lib/cfwarp/recovery`). Directories use mode 0700 and files mode 0600; logs identify the specific path. Incomplete configuration restoration prevents automatic restart. Follow the instructions and verify recovery before deleting that run's directory. Backups contain credentials; do not publish or source them as Shell code.
+
 Trigger manually and inspect logs:
 
 ```bash
@@ -371,3 +389,5 @@ sudo ./install.sh --clean-generated
 ```
 
 Private configuration and WARP data remain available for recovery or separate handling. Resolve any shutdown failure before cleaning files: deleting runtime files does not prove kernel network resources were removed.
+
+Without `--force`, an active main, watchdog, or endpoint-refresh service causes cleanup to be refused while preserving service and timer state. Checks repeat after acquiring the installation lock to detect changes while waiting.

@@ -55,6 +55,9 @@ command -v setsid >/dev/null 2>&1 || {
     exit 1
 }
 CFWARP_CHILD_PID=
+CFWARP_PREPARED_DIR=$(mktemp -d)
+CFWARP_PREPARED_ENDPOINTS_FILE="${CFWARP_PREPARED_DIR}/endpoints"
+CFWARP_NETWORK_STARTED=0
 cleanup_netns() {
     CFWARP_EXIT_STATUS=$?
     trap - EXIT
@@ -72,9 +75,12 @@ cleanup_netns() {
         wait "$CFWARP_CHILD_PID" 2>/dev/null || true
         CFWARP_CHILD_PID=
     fi
-    if ! sh "${SCRIPT_DIR}/cfwarp-netns.sh" down; then
-        CFWARP_EXIT_STATUS=1
+    if [ "$CFWARP_NETWORK_STARTED" = 1 ]; then
+        if ! sh "${SCRIPT_DIR}/cfwarp-netns.sh" down; then
+            CFWARP_EXIT_STATUS=1
+        fi
     fi
+    rm -rf "$CFWARP_PREPARED_DIR"
     exit "$CFWARP_EXIT_STATUS"
 }
 # Install supervision before setup: a stop during setup must wait for its
@@ -83,6 +89,14 @@ trap cleanup_netns EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+# Bootstrap uses the host network, before any application namespace exists.
+# Supervise it too so a stop cancels downloads and resolver descendants.
+setsid env CFWARP_PREPARE_ONLY=1 CFWARP_PREPARED_ENDPOINTS_FILE="$CFWARP_PREPARED_ENDPOINTS_FILE" \
+    sh "${SCRIPT_DIR}/entrypoint.sh" &
+CFWARP_CHILD_PID=$!
+wait "$CFWARP_CHILD_PID"
+CFWARP_CHILD_PID=
+CFWARP_NETWORK_STARTED=1
 setsid sh "${SCRIPT_DIR}/cfwarp-netns.sh" up &
 CFWARP_CHILD_PID=$!
 wait "$CFWARP_CHILD_PID"
@@ -98,6 +112,7 @@ setsid ip netns exec "$NETNS_NAME" env \
     WGCF_PROFILE="$WGCF_PROFILE" \
     WGCF_ACCOUNT="$WGCF_ACCOUNT" \
     WG_QUICK_BIN="$WG_QUICK_BIN" \
+    CFWARP_PREPARE_ONLY=0 CFWARP_PREPARED_ENDPOINTS_FILE="$CFWARP_PREPARED_ENDPOINTS_FILE" \
     sh "${SCRIPT_DIR}/entrypoint.sh" &
 CFWARP_CHILD_PID=$!
 wait "$CFWARP_CHILD_PID"

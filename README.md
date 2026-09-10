@@ -25,6 +25,7 @@ CFWarp 将 Cloudflare WARP 封装为 Linux 服务器上的 **TCP SOCKS5 出站�
 ### 对用户的价值
 
 - **按应用选择出口**：默认不替换宿主机默认路由，便于在一台服务器上同时运行使用不同出口的服务。
+- **故障时阻止直连回落**：默认 namespace 模式在隧道就绪前、接口或路由丢失时阻断应用直连；应用 DNS 也通过隧道发送。
 - **使用已有代理接口**：支持 SOCKS5 的应用直接接入；`socks5h` 将目标域名交给代理端解析。没有代理选项的命令可以通过 `cfwarp-exec` 在 namespace 中运行。
 - **便于运维**：systemd 管理启动、停止和重启；健康检查验证 SOCKS5 与 WARP 状态，watchdog 在连续失败后按冷却策略尝试恢复。
 - **状态留在自己的服务器**：私有配置、WARP 账户和 WireGuard 配置保存在本机；依赖版本固定，并校验默认 `wgcf` 下载。
@@ -35,7 +36,7 @@ CFWarp 将 Cloudflare WARP 封装为 Linux 服务器上的 **TCP SOCKS5 出站�
 
 当前提供 **IPv4 WARP 出站和 TCP SOCKS5**；不提供 UDP 代理、HTTP 代理、透明代理或桌面 VPN 客户端。默认模式仍会创建 veth、添加本项目的转发/NAT 规则并按需启用 IPv4 转发，区别在于不替换宿主机默认路由。
 
-可选的 `host-global` 模式会改变宿主机 IPv4 路由，仅在明确需要整机出口时启用。实际连通性、速度和出口位置取决于服务器网络、WARP 及目标服务；项目不保证某个服务可访问，也没有固定内存或性能承诺。
+可选的 `host-global` 模式会改变宿主机 IPv4 路由，不提供 namespace 模式的故障出口阻断，仅在明确需要整机出口时启用。实际连通性、速度和出口位置取决于服务器网络、WARP 及目标服务；项目不保证某个服务可访问，也没有固定内存或性能承诺。
 
 ### 快速开始
 
@@ -47,7 +48,7 @@ sudo editor /etc/cfwarp/cfwarp.env
 sudo systemctl enable --now cfwarp.service
 ```
 
-缺少隧道配置时，CFWarp 通过 `wgcf` 生成配置；已有账户会被复用，账户也不存在时才注册新账户，该注册使用接受服务条款的选项。日常健康守护默认启用；每日 Endpoint 刷新默认关闭。
+缺少隧道配置时，CFWarp 通过 `wgcf` 生成配置；已有账户会被复用，账户也不存在时才注册新账户，该注册使用接受服务条款的选项。账户初始化和隧道 Endpoint 的初始域名解析使用宿主机网络，在应用 namespace 启用前完成。日常健康守护默认启用；每日 Endpoint 刷新默认关闭。
 
 确认出口：
 
@@ -99,6 +100,7 @@ Other host apps → existing default egress
 ### Why use it
 
 - **Choose egress per application.** The default mode preserves the host default route, allowing services with different egress requirements to share a server.
+- **Block direct fallback on failure.** Default namespace mode blocks direct application egress before tunnel readiness and if its interface or routes disappear. Application DNS also uses the tunnel.
 - **Use standard proxy settings.** SOCKS5-capable applications connect directly; `socks5h` delegates destination DNS resolution to the proxy. Commands without proxy support can run inside the namespace using `cfwarp-exec`.
 - **Operate through familiar tools.** systemd manages the service. Health checks verify SOCKS5 connectivity and WARP status; the watchdog attempts recovery after repeated failures, with a restart cooldown.
 - **Keep configuration on your server.** Private settings, the WARP account, and WireGuard configuration remain local. Dependencies are pinned, and the default `wgcf` download is checksum-verified.
@@ -109,7 +111,7 @@ Requires Linux, systemd, root access, and support for in-kernel WireGuard, netwo
 
 The current scope is **IPv4 WARP egress and TCP SOCKS5**. It does not include UDP proxying, an HTTP proxy, transparent proxying, or a desktop VPN client. Default setup creates veth devices and project-owned forwarding/NAT rules, and enables IPv4 forwarding when needed; it preserves the host default route.
 
-The optional `host-global` mode changes host IPv4 routing and should be enabled only when host-wide egress is intended. Connectivity, speed, and egress location depend on the server network, WARP, and the destination service. No fixed resource footprint, performance, or access to a particular service is guaranteed.
+The optional `host-global` mode changes host IPv4 routing and does not provide namespace mode's fail-closed egress protection. Enable it only when host-wide egress is intended. Connectivity, speed, and egress location depend on the server network, WARP, and the destination service. No fixed resource footprint, performance, or access to a particular service is guaranteed.
 
 ### Quick start
 
@@ -121,7 +123,7 @@ sudo editor /etc/cfwarp/cfwarp.env
 sudo systemctl enable --now cfwarp.service
 ```
 
-When the tunnel profile is missing, CFWarp generates it through `wgcf`, reusing an existing account. It registers a new account only if no account exists; registration uses the accept-terms option. The health watchdog is enabled by default; daily endpoint refresh is disabled by default.
+When the tunnel profile is missing, CFWarp generates it through `wgcf`, reusing an existing account. It registers a new account only if no account exists; registration uses the accept-terms option. Account initialization and initial tunnel-endpoint DNS resolution use the host network before the application namespace is started. The health watchdog is enabled by default; daily endpoint refresh is disabled by default.
 
 Verify the egress:
 

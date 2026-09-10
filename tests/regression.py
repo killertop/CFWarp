@@ -97,6 +97,26 @@ class Regression(unittest.TestCase):
         self.assertEqual(r.stdout.strip(), str(data))
         self.assertFalse((self.base / "fallback").exists())
 
+    def test_endpoint_resolution_preserves_identity_and_rejects_bad_answers(self):
+        for endpoint in ("192.0.2.40:2408", "[2001:db8::40]:2408"):
+            r = self.shell('cfwarp_resolve_endpoint "$1"', endpoint)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.strip(), endpoint)
+        for endpoint in ("999.0.2.40:2408", "192.00.2.40:2408", "123:2408", "host:0"):
+            self.assertNotEqual(self.shell('cfwarp_resolve_endpoint "$1"', endpoint).returncode, 0)
+        bins = self.base / "bin"
+        bins.mkdir()
+        (bins / "timeout").write_text('#!/bin/sh\n[ "$1" = --kill-after=1 ] && [ "$2" = 5 ] || exit 99\nshift 2\nexec "$@"\n')
+        (bins / "getent").write_text('#!/bin/sh\n[ "$1" = ahostsv4 ] || exit 99\ncase "$2" in valid.invalid) printf "192.0.2.41 STREAM valid.invalid\\n";; bad.invalid) printf "999.0.2.41 STREAM bad.invalid\\n";; *) exit 2;; esac\n')
+        for tool in bins.iterdir():
+            tool.chmod(0o755)
+        env = dict(self.env, PATH=f"{bins}:{self.env['PATH']}")
+        r = self.shell('cfwarp_resolve_endpoint "$1"', "valid.invalid:2408", env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout, "192.0.2.41:2408\n")
+        for endpoint in ("bad.invalid:2408", "missing.invalid:2408"):
+            self.assertNotEqual(self.shell('cfwarp_resolve_endpoint "$1"', endpoint, env=env).returncode, 0)
+
     def test_installed_doctor_uses_runtime_manifest(self):
         installed = self.base / "installed"
         installed.mkdir()

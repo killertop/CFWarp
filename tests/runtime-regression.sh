@@ -37,8 +37,14 @@ set -eu
 printf '%s %s\n' "$1" "$2" >> "$FAKE_ROOT/wg-quick.log"
 case "$1" in
     up)
+        if [ "${FAKE_REMOVE_BACKUP:-0}" = 1 ]; then
+            rm -f "$2".before.*
+            exit 1
+        fi
         [ "${FAKE_WG_UP_FAIL:-0}" = 0 ] || exit 1
         if grep -F stale.invalid "$2" >/dev/null; then exit 1; fi
+        awk '/^Endpoint[[:space:]]*=/ {print}' "$2" >> "$FAKE_ROOT/up-endpoints"
+        grep -Fx 'FwMark = 51820' "$2" >/dev/null || { echo missing_guard_mark >&2; exit 1; }
         if [ "${FAKE_WRONG_ENDPOINT:-0}" = 1 ]; then
             printf '192.0.2.10:2408\n' > "$FAKE_ROOT/active-endpoint"
         else
@@ -104,6 +110,10 @@ cat > "$TMP/bin/microsocks" <<'STUB'
 #!/bin/sh
 exit 0
 STUB
+cat > "$TMP/bin/getent" <<'STUB'
+#!/bin/sh
+exit 2
+STUB
 cat > "$TMP/bin/systemctl" <<'STUB'
 #!/bin/sh
 exit 1
@@ -166,6 +176,40 @@ CFWARP_PROBE_MODE=1 ENDPOINT_IP=192.0.2.20:2408 CFWARP_PROBE_METRICS_FILE="$TMP/
 cmp "$WG_CONF" "$TMP/stale-original.conf" || fail 'probe changed original config bytes'
 if FAKE_WG_UP_FAIL=1 ENDPOINT_IP=192.0.2.20:2408 sh "$TMP/project/entrypoint.sh" > "$TMP/up-failure.out" 2>&1; then fail 'wg-quick failure passed'; fi
 cmp "$WG_CONF" "$TMP/stale-original.conf" || fail 'wg-quick failure lost original config'
+if FAKE_REMOVE_BACKUP=1 ENDPOINT_IP=192.0.2.20:2408 \
+    sh "$TMP/project/entrypoint.sh" > "$TMP/missing-backup.out" 2>&1; then fail 'missing rollback original passed'; fi
+[ -s "$WG_CONF" ] || fail 'unreadable rollback backup truncated active configuration'
+grep -Fx 'PrivateKey = test-private-key' "$WG_CONF" >/dev/null || fail 'backup read error lost configuration contents'
+cp "$TMP/stale-original.conf" "$WG_CONF"
+
+# Candidate-only recovery must happen before the first wg-quick up. A failed
+# first DNS name cannot prevent valid literal fallback candidates from running.
+: > "$TMP/up-endpoints"
+ENDPOINT_IP='' ENDPOINT_CANDIDATES='192.0.2.30:2408' \
+    sh "$TMP/project/entrypoint.sh" > "$TMP/candidate-only.out" 2>&1 || { cat "$TMP/candidate-only.out" >&2; fail 'candidate-only DNS recovery failed'; }
+grep -Fx 'Endpoint = 192.0.2.30:2408' "$WG_CONF" >/dev/null || fail 'fallback was not persisted'
+[ "$(cat "$TMP/up-endpoints")" = 'Endpoint = 192.0.2.30:2408' ] || fail 'unresolved initial endpoint reached wg-quick'
+cp "$TMP/stale-original.conf" "$WG_CONF"
+if ENDPOINT_IP='' ENDPOINT_CANDIDATES='192.0.2.30:2408' FAKE_CURL_FAIL=1 \
+    sh "$TMP/project/entrypoint.sh" > "$TMP/candidate-only-failure.out" 2>&1; then fail 'unhealthy fallback passed'; fi
+cmp "$WG_CONF" "$TMP/stale-original.conf" || fail 'failed fallback lost original bytes'
+
+# Host bootstrap only prepares account/profile and literal endpoint mappings;
+# it must not launch WireGuard, curl health probes or the application proxy.
+: > "$TMP/wg-quick.log"
+: > "$TMP/curl-attempts"
+CFWARP_PREPARE_ONLY=1 CFWARP_PREPARED_ENDPOINTS_FILE="$TMP/prepared-map" \
+    ENDPOINT_IP='' ENDPOINT_CANDIDATES='192.0.2.40:2408' \
+    sh "$TMP/project/entrypoint.sh" > "$TMP/bootstrap.out" 2>&1 || fail 'host bootstrap failed'
+[ "$(cat "$TMP/prepared-map")" = "$(printf '192.0.2.40:2408\t192.0.2.40:2408')" ] || fail 'wrong prepared mapping'
+[ ! -s "$TMP/wg-quick.log" ] && [ ! -s "$TMP/curl-attempts" ] || fail 'bootstrap started runtime networking'
+cmp "$WG_CONF" "$TMP/stale-original.conf" || fail 'bootstrap changed existing profile'
+# A prepared domain mapping is used without fresh namespace DNS and the
+# original configured domain is retained after its literal address succeeds.
+printf 'prepared.invalid:2408\t192.0.2.40:2408\n' > "$TMP/prepared-map"
+CFWARP_PREPARED_ENDPOINTS_FILE="$TMP/prepared-map" ENDPOINT_IP='' \
+    sh "$TMP/project/entrypoint.sh" > "$TMP/prepared.out" 2>&1 || fail 'prepared domain mapping failed'
+grep -Fx 'Endpoint = prepared.invalid:2408' "$WG_CONF" >/dev/null || fail 'configured domain identity lost'
 cp "$TMP/base.conf" "$WG_CONF"
 
 # Watchdog owns its retry policy; inherited ordinary health options never

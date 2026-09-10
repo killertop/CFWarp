@@ -29,6 +29,8 @@ jobs:
         run: shellcheck --severity=warning *.sh cfwarp-exec cmd/cfwarp lib/cfwarp-common.sh tests/*.sh
       - name: Isolated Linux network and systemd regression
         run: sudo sh tests/network-regression.sh --live
+      - name: Tunnel failure and direct-egress blocking regression
+        run: sudo python3 tests/network-egress-regression.py --live
       - name: Custom installation and cleanup regression
         run: sudo sh tests/install-regression.sh --live
       - name: Check diff whitespace

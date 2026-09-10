@@ -1,5 +1,29 @@
 # 更新记录 / Changelog
 
+## 2026-09-10
+
+### 中文
+
+补充异常分支审查后，修复上一版测试未覆盖的锁失败、出口回落和恢复问题。
+
+- 明确传播转发锁失败；在锁超时后保留引用计数、原始状态和内核转发设置。
+- 在 namespace 连网前启用 IPv4/IPv6 出口默认拒绝，阻止隧道接口或路由消失时应用回落直连；`cfwarp-exec` 在归属锁内检查就绪并进入同一 namespace。
+- 将账户初始化和初始 Endpoint DNS 放在宿主机，使用数字地址启动隧道，使旧域名失效时仍能尝试备用 IP；namespace 内应用 DNS 不设直连例外。
+- 清理前识别活动及启动/停止中的 systemd 服务，在安装锁前后检查；拒绝时保留服务、定时器和运行文件。
+- 刷新失败时保留持久、受限权限的原配置与恢复说明，避免启动部分恢复的配置；修复启动脚本读取备份失败可能清空配置的问题。
+- 增加故障注入、真实锁竞争、网络阻断及 systemd 异常状态回归；保留 Shell 控制层，中英文文档同步说明使用边界。
+
+### English
+
+Follow-up failure-path review fixed locking, direct-egress fallback, and recovery gaps missed by the previous test coverage.
+
+- Propagate forwarding-lock failure explicitly, preserving reference counts, original state, and kernel forwarding settings on timeout.
+- Install IPv4/IPv6 default-deny egress before namespace connectivity, blocking direct fallback if tunnel interfaces or routes disappear. `cfwarp-exec` checks readiness and enters the same namespace under its ownership lock.
+- Initialize accounts and resolve initial endpoint DNS on the host, starting the tunnel with literal addresses so backup IPs remain usable when an old hostname fails. Application DNS has no direct-egress exception.
+- Check active and transitioning systemd services before and after the installation lock; refused cleanup preserves services, timers, and runtime files.
+- Retain persistent, permission-restricted originals and recovery instructions after refresh failure, and avoid starting partially restored configuration. Fix entrypoint backup-read failure potentially truncating configuration.
+- Add fault injection, real lock contention, egress-blocking, and systemd failure-state regressions; retain the Shell control layer and update bilingual usage boundaries.
+
 ## 2026-09-09
 
 ### 中文

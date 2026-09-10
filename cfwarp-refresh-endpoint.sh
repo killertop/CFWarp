@@ -70,7 +70,13 @@ if ! flock -n 9; then
     exit 0
 fi
 # Keep the lock file: unlinking it can create two independent lock inodes.
-TMP_ROOT=$(mktemp -d)
+# Recovery originals are written to persistent storage before any service or
+# configuration mutation. A failed run never relies on volatile /tmp or /run.
+RECOVERY_ROOT="${CFWARP_DATA_DIR}/recovery"
+install -d -m 0700 "$RECOVERY_ROOT"
+TMP_ROOT=$(mktemp -d "${RECOVERY_ROOT}/endpoint-refresh-$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")
+RECOVERY_REQUIRED=0
+RECOVERY_LOG="${TMP_ROOT}/recovery.log"
 PROBE_TOKEN=$$
 PROBE_NETNS="cfpr${PROBE_TOKEN}"
 PROBE_HOST_IF="cfh${PROBE_TOKEN}"
@@ -87,8 +93,14 @@ SERVICE_NEEDS_RESTORE=0
 CONFIG_CHANGED=0
 HAD_WG_CONF=0
 [ -f "$WG_CONF" ] && HAD_WG_CONF=1
-install -m 0600 "$SOURCE_CONF" "${TMP_ROOT}/original-wg.conf"
-install -m 0600 "$CFWARP_ENV_FILE" "${TMP_ROOT}/original.env"
+
+record_recovery_event() {
+    if ! printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$RECOVERY_LOG"; then
+        RECOVERY_REQUIRED=1
+        echo "==> [ERROR] 无法写入恢复日志: $RECOVERY_LOG" >&2
+        return 1
+    fi
+}
 
 stop_probe_processes() {
     [ -n "$ACTIVE_PROBE_PID" ] || return 0
@@ -124,43 +136,135 @@ cleanup_probe_network() {
 
 restore_original_config() {
     [ "$CONFIG_CHANGED" = "1" ] || return 0
-    cat "${TMP_ROOT}/original.env" | cfwarp_atomic_write_from_stdin "$CFWARP_ENV_FILE" || return 1
-    if [ "$HAD_WG_CONF" = "1" ]; then
-        cat "${TMP_ROOT}/original-wg.conf" | cfwarp_atomic_write_from_stdin "$WG_CONF" || return 1
+    CFWARP_RESTORE_FAILED=0
+    if cfwarp_atomic_write_from_stdin "$CFWARP_ENV_FILE" < "${TMP_ROOT}/original.env" >> "$RECOVERY_LOG" 2>&1; then
+        record_recovery_event 'Original environment restored.' || return 1
     else
-        rm -f "$WG_CONF" || return 1
+        record_recovery_event 'FAILED: original environment could not be restored.' || true
+        CFWARP_RESTORE_FAILED=1
     fi
+    if [ "$HAD_WG_CONF" = "1" ]; then
+        if cfwarp_atomic_write_from_stdin "$WG_CONF" < "${TMP_ROOT}/original-wg.conf" >> "$RECOVERY_LOG" 2>&1; then
+            record_recovery_event 'Original WireGuard configuration restored.' || return 1
+        else
+            record_recovery_event 'FAILED: original WireGuard configuration could not be restored.' || true
+            CFWARP_RESTORE_FAILED=1
+        fi
+    elif rm -f "$WG_CONF" >> "$RECOVERY_LOG" 2>&1; then
+        record_recovery_event 'Generated WireGuard configuration removed; none existed before refresh.' || return 1
+    else
+        record_recovery_event 'FAILED: generated WireGuard configuration could not be removed.' || true
+        CFWARP_RESTORE_FAILED=1
+    fi
+    [ "$CFWARP_RESTORE_FAILED" -eq 0 ] || return 1
     CONFIG_CHANGED=0
 }
 
 start_and_verify_service() {
-    systemctl start "$CFWARP_SERVICE_NAME" &&
-        "$SCRIPT_DIR/cfwarp-healthcheck.sh" --wait &&
-        systemctl is-active --quiet "$CFWARP_SERVICE_NAME"
+    record_recovery_event 'Starting service and checking SOCKS/WARP health.' || return 1
+    if systemctl start "$CFWARP_SERVICE_NAME" >> "$RECOVERY_LOG" 2>&1 &&
+        "$SCRIPT_DIR/cfwarp-healthcheck.sh" --wait >> "$RECOVERY_LOG" 2>&1 &&
+        systemctl is-active --quiet "$CFWARP_SERVICE_NAME" >> "$RECOVERY_LOG" 2>&1; then
+        record_recovery_event 'Service is active and SOCKS/WARP health passed.'
+    else
+        RECOVERY_REQUIRED=1
+        record_recovery_event 'FAILED: service start or SOCKS/WARP health verification.' || true
+        return 1
+    fi
 }
 
 cleanup() {
     CFWARP_EXIT_STATUS=$?
     trap - EXIT HUP INT TERM
     stop_probe_processes
-    cleanup_probe_network || CFWARP_EXIT_STATUS=1
+    if ! cleanup_probe_network >> "$RECOVERY_LOG" 2>&1; then
+        RECOVERY_REQUIRED=1
+        CFWARP_EXIT_STATUS=1
+        record_recovery_event 'FAILED: probe network cleanup; ownership state must be inspected.' || true
+    fi
     if [ "$SERVICE_NEEDS_RESTORE" = "1" ]; then
+        CFWARP_CAN_RESTART=1
         if [ "$CONFIG_CHANGED" = "1" ]; then
-            systemctl stop "$CFWARP_SERVICE_NAME" || CFWARP_EXIT_STATUS=1
-            restore_original_config || CFWARP_EXIT_STATUS=1
+            if ! systemctl stop "$CFWARP_SERVICE_NAME" >> "$RECOVERY_LOG" 2>&1; then
+                RECOVERY_REQUIRED=1
+                CFWARP_EXIT_STATUS=1
+                CFWARP_CAN_RESTART=0
+                record_recovery_event 'FAILED: service stop; configuration rollback was not attempted.' || true
+            elif ! restore_original_config; then
+                RECOVERY_REQUIRED=1
+                CFWARP_EXIT_STATUS=1
+                CFWARP_CAN_RESTART=0
+                record_recovery_event 'FAILED: configuration rollback is incomplete; service was not restarted.' || true
+            fi
         fi
-        if start_and_verify_service; then
-            echo "==> [CFwarp] 原服务已恢复并通过 SOCKS/WARP 健康检查。"
+        if [ "$CFWARP_CAN_RESTART" = "1" ]; then
+            if start_and_verify_service; then
+                echo "==> [CFwarp] 原服务已恢复并通过 SOCKS/WARP 健康检查。"
+            else
+                echo "==> [ERROR] 原服务恢复后未通过健康检查。" >&2
+                CFWARP_EXIT_STATUS=1
+            fi
         else
-            echo "==> [ERROR] 原服务恢复后未通过健康检查，请检查 systemd 日志。" >&2
+            echo "==> [ERROR] 自动回滚未完成，已停止自动启动，请按恢复说明处理。" >&2
+        fi
+    elif [ "$CONFIG_CHANGED" = "1" ]; then
+        # A failure during an inactive service's configuration save is also
+        # recoverable; do not discard originals after a partial write failure.
+        RECOVERY_REQUIRED=1
+        if ! restore_original_config; then
             CFWARP_EXIT_STATUS=1
+            record_recovery_event 'FAILED: inactive-service configuration rollback.' || true
         fi
     fi
-    rm -rf "$TMP_ROOT"
+    if [ "$RECOVERY_REQUIRED" = "1" ]; then
+        record_recovery_event "Recovery material retained; refresh exit status: $CFWARP_EXIT_STATUS." || true
+        echo "==> [ERROR] 原配置与恢复说明已保留: ${TMP_ROOT}/RECOVERY.txt" >&2
+        echo "==> [ERROR] 恢复日志（仅限本机授权用户读取）: $RECOVERY_LOG" >&2
+    else
+        rm -rf "$TMP_ROOT"
+    fi
     exit "$CFWARP_EXIT_STATUS"
 }
 trap cleanup EXIT
 trap 'exit 143' HUP INT TERM
+
+install -m 0600 "$SOURCE_CONF" "${TMP_ROOT}/original-wg.conf"
+install -m 0600 "$CFWARP_ENV_FILE" "${TMP_ROOT}/original.env"
+cat > "${TMP_ROOT}/RECOVERY.txt" <<EOF_RECOVERY
+CFWarp endpoint refresh recovery / Endpoint 刷新恢复
+
+Service / 服务: $CFWARP_SERVICE_NAME
+Original environment backup / 原环境备份: ${TMP_ROOT}/original.env
+Environment destination / 环境文件原位置: $CFWARP_ENV_FILE
+Original WireGuard source / 原 WireGuard 配置来源: $SOURCE_CONF
+Original WireGuard backup / 原 WireGuard 备份: ${TMP_ROOT}/original-wg.conf
+WireGuard runtime destination / WireGuard 运行配置位置: $WG_CONF
+Runtime config existed before refresh / 刷新前运行配置存在 (1=yes, 0=no): $HAD_WG_CONF
+Probe namespace / 探测命名空间: $PROBE_NETNS
+Probe ownership state / 探测资源归属状态: $PROBE_STATE_DIR
+Log / 日志: $RECOVERY_LOG
+Health check command / 健康检查脚本: ${SCRIPT_DIR}/cfwarp-healthcheck.sh --wait
+
+Manual recovery / 人工恢复:
+1. Inspect recovery.log and stop the service before changing its configuration.
+   查看日志，并在改动配置前停止上述服务。
+2. Restore original.env to its destination above; keep mode 0600.
+   将 original.env 恢复至上述环境文件位置，权限保持 0600。
+3. If the runtime config existed (1), restore original-wg.conf to the runtime
+   destination with mode 0600. Otherwise (0), confirm and remove only the runtime
+   config generated by this refresh; the backup came from the profile source.
+   若运行配置原先存在(1)，恢复 original-wg.conf，权限 0600；若原先不存在(0)，
+   核实后仅移除本次刷新生成的运行配置，备份来自原 profile。
+4. Check any remaining probe ownership state. Start the service, run the health
+   check with the same CFWARP_ENV_FILE, and verify that the service stays active.
+   核查探测资源归属状态；启动服务，用相同环境文件运行健康检查，并确认服务持续运行。
+5. Delete only this recovery directory after recovery has been verified.
+   仅在验证恢复完成后，删除本次恢复目录。
+
+Backups contain credentials. Do not publish them or source them as shell code.
+备份包含凭证，请勿公开或作为 Shell 脚本执行。
+EOF_RECOVERY
+record_recovery_event 'Protected original configurations saved before refresh.'
 
 if systemd_available && systemctl is-active --quiet "$CFWARP_SERVICE_NAME"; then
     if [ "$CFWARP_ENDPOINT_REFRESH_ACTIVE_MODE" = "skip" ]; then
@@ -203,6 +307,10 @@ while IFS= read -r CANDIDATE_ENDPOINT; do
         echo "==> [CFwarp] 跳过非法 Endpoint。" >&2
         continue
     fi
+    if ! RESOLVED_CANDIDATE_ENDPOINT=$(cfwarp_resolve_endpoint "$CANDIDATE_ENDPOINT"); then
+        echo "==> [CFwarp] 宿主机无法解析候选 Endpoint，已跳过。" >&2
+        continue
+    fi
     INDEX=$((INDEX + 1))
     [ "$INDEX" -le 60 ] || { echo "==> [CFwarp] 达到候选数限制，忽略多余 Endpoint。" >&2; break; }
     CANDIDATE_DIR="${TMP_ROOT}/candidate-${INDEX}"
@@ -223,7 +331,7 @@ while IFS= read -r CANDIDATE_ENDPOINT; do
         WG_INTERFACE="$PROBE_WG_IF" WG_QUICK_BIN="$WG_QUICK_BIN" \
         CFWARP_DATA_DIR="$CANDIDATE_DIR" WG_CONF_DIR="$CANDIDATE_DIR" WG_CONF="$CANDIDATE_CONF" \
         WGCF_PROFILE="${TMP_ROOT}/original-wg.conf" WGCF_ACCOUNT="$WGCF_ACCOUNT" \
-        ENDPOINT_IP="$CANDIDATE_ENDPOINT" ENDPOINT_CANDIDATES='' \
+        ENDPOINT_IP="$RESOLVED_CANDIDATE_ENDPOINT" ENDPOINT_CANDIDATES='' \
         CFWARP_PROBE_MODE=1 CFWARP_PROBE_URL="$CFWARP_ENDPOINT_PROBE_URL" \
         CFWARP_PROBE_SAMPLES="$CFWARP_ENDPOINT_PROBE_SAMPLES" CFWARP_PROBE_METRICS_FILE="$CANDIDATE_METRICS" \
         setsid timeout --kill-after=5 "$CFWARP_ENDPOINT_CANDIDATE_TIMEOUT_SECONDS" \
@@ -241,12 +349,12 @@ while IFS= read -r CANDIDATE_ENDPOINT; do
     SELECTED_ENDPOINT=$(metric SELECTED_ENDPOINT "$CANDIDATE_METRICS")
     RUNTIME_ENDPOINT=$(metric RUNTIME_ENDPOINT "$CANDIDATE_METRICS")
     SCORE=$(metric SCORE "$CANDIDATE_METRICS")
-    if [ "$SELECTED_ENDPOINT" != "$CANDIDATE_ENDPOINT" ] || ! cfwarp_validate_endpoint "$RUNTIME_ENDPOINT" || ! valid_score "$SCORE"; then
+    if [ "$SELECTED_ENDPOINT" != "$RESOLVED_CANDIDATE_ENDPOINT" ] || ! cfwarp_validate_endpoint "$RUNTIME_ENDPOINT" || ! valid_score "$SCORE"; then
         echo "==> [ERROR] 候选指标与实际探测目标不一致或格式非法，忽略结果。" >&2
         continue
     fi
     if score_is_better "$SCORE" "$BEST_SCORE"; then
-        BEST_ENDPOINT=$SELECTED_ENDPOINT
+        BEST_ENDPOINT=$CANDIDATE_ENDPOINT
         BEST_SCORE=$SCORE
     fi
     [ "$CANDIDATE_ENDPOINT" != "$CURRENT_ENDPOINT" ] || CURRENT_SCORE=$SCORE

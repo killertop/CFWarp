@@ -311,19 +311,48 @@ install_runtime_files() {
     render_template "${TEMPLATE_DIR}/cfwarp-watchdog.timer.in" "$WATCHDOG_TIMER"
 }
 
+cleanup_read_unit_state() {
+    CFWARP_CLEAN_ACTIVE_STATE=$(systemctl show --property=ActiveState --value "$1") || return 1
+    CFWARP_CLEAN_UNIT_RUNNING=1
+    case "$CFWARP_CLEAN_ACTIVE_STATE" in
+        inactive|failed) CFWARP_CLEAN_UNIT_RUNNING=0 ;;
+        '') echo "无法读取 $1 的运行状态，拒绝清理。" >&2; return 1 ;;
+    esac
+}
+
+cleanup_preflight() {
+    # A refresh may have temporarily stopped the main service and will restore
+    # it when cancelled, so helpers also require --force. This check is read-only.
+    if [ "$CFWARP_CLEAN_SYSTEMD" = 1 ] && [ "$FORCE_CLEAN" != 1 ]; then
+        for CFWARP_CLEAN_UNIT in cfwarp.service cfwarp-watchdog.service cfwarp-endpoint-refresh.service; do
+            # oneshot helpers are activating while their command runs, which
+            # systemctl is-active does not recognize as active.
+            cleanup_read_unit_state "$CFWARP_CLEAN_UNIT" || return 1
+            if [ "$CFWARP_CLEAN_UNIT_RUNNING" = 1 ]; then
+                echo "$CFWARP_CLEAN_UNIT 正在运行，拒绝清理；请先停止服务或加 --force。" >&2
+                return 1
+            fi
+        done
+    fi
+}
+
 clean_generated() {
     require_root
+    CFWARP_CLEAN_SYSTEMD=0
+    if systemd_available; then CFWARP_CLEAN_SYSTEMD=1; fi
+    cleanup_preflight || return 1
     acquire_install_lock
-    if systemd_available; then
+    # Another installer may have started a service before this lock was acquired.
+    # Recheck before the first stop/disable instead of acting on stale state.
+    cleanup_preflight || return 1
+    if [ "$CFWARP_CLEAN_SYSTEMD" = 1 ]; then
         systemctl stop cfwarp-watchdog.timer cfwarp-endpoint-refresh.timer >/dev/null 2>&1 || true
         for CFWARP_CLEAN_UNIT in cfwarp-watchdog.service cfwarp-endpoint-refresh.service; do
-            if systemctl is-active --quiet "$CFWARP_CLEAN_UNIT"; then systemctl stop "$CFWARP_CLEAN_UNIT"; fi
+            cleanup_read_unit_state "$CFWARP_CLEAN_UNIT" || return 1
+            if [ "$CFWARP_CLEAN_UNIT_RUNNING" = 1 ]; then systemctl stop "$CFWARP_CLEAN_UNIT"; fi
         done
-        if systemctl is-active --quiet cfwarp.service; then
-            if [ "$FORCE_CLEAN" != "1" ]; then
-                echo "cfwarp.service 正在运行，拒绝清理；请先停止服务或加 --force。" >&2
-                exit 1
-            fi
+        cleanup_read_unit_state cfwarp.service || return 1
+        if [ "$CFWARP_CLEAN_UNIT_RUNNING" = 1 ]; then
             systemctl stop cfwarp.service
         fi
         systemctl disable --now cfwarp-watchdog.timer cfwarp-endpoint-refresh.timer >/dev/null 2>&1 || true
