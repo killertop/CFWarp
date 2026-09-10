@@ -41,6 +41,8 @@ Endpoint 刷新开始前把原配置放入数据目录下独立、受限权限�
 
 ### systemd 与升级边界
 
+主服务启动/清理与 Endpoint 刷新按同一数据目录持有生命周期锁（FD 6）。刷新先识别全部活动/过渡状态并停止主服务，再取得锁、重新检查状态和读取配置；主服务在锁内加载配置并持锁至资源清理结束。刷新在探测前写入 `.refresh-pending`，只有确认探测清理完成才解除阻断并释放锁，然后调用 systemd 启动，避免等待自身持有的锁。探测清理或配置回滚失败保留标记，阻止后续自动启动；`ExecStopPost` 也取得同一锁，不能清理另一个活动控制器的资源。该互斥范围是使用同一数据目录的受管理入口，不覆盖手动绕过入口或把同一密钥复制到不同目录的程序。
+
 主服务、健康守护和 Endpoint 刷新必须与宿主机上的 `cfwarp-exec` 看到同一组 `/run/netns` 命名空间挂载。因此服务显式使用 `PrivateTmp=false` 和 `ProtectHome=false`，避免这些文件系统沙箱选项创建独立 mount namespace，导致一个命令创建的网络 namespace 对其他命令不可见。仍保留 `NoNewPrivileges` 等不改变该挂载可见性的限制。服务以 root 运行；这一取舍应连同网络权限一起审查，不能将这些 unit 描述为完整的文件系统隔离沙箱。
 
 systemd unit 只传入 `CFWARP_ENV_FILE` 的路径，由所有入口共用的数据解析器加载内容；unit 不再通过 `EnvironmentFile` 额外解析同一文件，从而避免 CLI 与服务对引号、行尾注释和优先级产生不同理解。
@@ -107,6 +109,8 @@ Before veth connectivity or a default route is available, default namespace mode
 Endpoint refresh saves originals in a separate persistent recovery directory with restricted permissions before making changes. Deployment verification, rollback, or resource-cleanup failure retains that directory; failed restoration does not start a partially restored configuration. Installation cleanup performs read-only refusal checks both before and after the lock, stopping services and timers only after those checks permit cleanup.
 
 ### systemd and upgrade boundaries
+
+Main startup/cleanup and endpoint refresh share a lifecycle lock (FD 6) per data directory. Refresh stops all active/transitioning service states before taking the lock, rereading service state, and snapshotting configuration. Main loads configuration under the lock and retains it through resource cleanup. Refresh writes `.refresh-pending` before probing and clears it only after confirmed cleanup, releasing the lock before asking systemd to start main so startup never waits on refresh's own lock. Failed probe cleanup or configuration rollback retains the marker and blocks later automatic starts. `ExecStopPost` takes the same lock to avoid removing another active controller's resources. This coordinates managed entry points sharing a data directory; it does not cover bypassing those entry points or copying one key into multiple directories.
 
 The main service, watchdog, endpoint refresh, and host-side `cfwarp-exec` must see the same named namespace mounts under `/run/netns`. Services therefore explicitly use `PrivateTmp=false` and `ProtectHome=false`: these filesystem sandbox options can create a separate mount namespace, hiding network namespace mounts from other commands. Restrictions such as `NoNewPrivileges` remain where they do not change mount visibility. Services run as root; review this tradeoff together with their network privileges, rather than describing the units as complete filesystem-isolation sandboxes.
 

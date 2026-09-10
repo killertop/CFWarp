@@ -155,7 +155,7 @@ ENDPOINT_CANDIDATES=<host-or-ip>:<port>,<host-or-ip>:<port>
 
 地址格式为 `host:port` 或 `[ipv6]:port`；IPv6 Endpoint 格式支持不代表提供 IPv6 WARP 出站。
 
-每日自动刷新默认关闭，可在安装时添加 `--enable-refresh-timer` 启用。默认的 `CFWARP_ENDPOINT_REFRESH_ACTIVE_MODE=skip` 会在主服务运行时跳过刷新；定时器不会默认停服测速。
+每日自动刷新默认关闭，可在安装时添加 `--enable-refresh-timer` 启用。默认的 `CFWARP_ENDPOINT_REFRESH_ACTIVE_MODE=skip` 会在主服务运行、启动或停止中跳过刷新；定时器不会默认停服测速。`stop-and-probe` 必须等待主服务完全停止后才能探测，状态读取失败会终止操作。
 
 只有需要中断活动服务进行评估时，才设置：
 
@@ -166,6 +166,8 @@ CFWARP_ENDPOINT_REFRESH_ACTIVE_MODE=stop-and-probe
 探测复用同一 WireGuard 身份并串行运行，避免多个探测隧道相互影响。每个候选受超时控制，退出时终止探测再清理其资源。当前 Endpoint 健康时，仅在达到改善阈值后切换；当前 Endpoint 不可用时，可以选择已验证可用的候选。恢复服务失败时尝试回滚原配置。测量只用于当时的候选比较，不证明长期带宽或稳定性。
 
 若切换验证、配置恢复或探测资源清理失败，原配置、日志与 `RECOVERY.txt` 保留在数据目录的 `recovery/endpoint-refresh-*` 中（默认 `/var/lib/cfwarp/recovery`）。目录权限 0700，文件权限 0600；日志会给出具体路径。恢复不完整时不自动启动半恢复的配置。按说明恢复并验证后再删除该次目录；备份包含凭证，不能公开或当作 Shell 脚本执行。
+
+主服务和刷新共用数据目录中的 `.service-probe.lock`。刷新期间启动主服务会被拒绝，正常刷新会在探测资源清理完成后释放锁，再恢复服务。若留下 `.refresh-pending`，后续启动和刷新也会拒绝；该文件指向恢复说明。先按资源归属状态清理残留探测接口、完成配置恢复，确认后才删除此标记，不能仅为强行启动而删除它。使用 `systemctl stop` 停服；直接运行清理脚本不会越过正在运行的控制器持有的锁。
 
 手动触发与查看日志：
 
@@ -350,7 +352,7 @@ ENDPOINT_CANDIDATES=<host-or-ip>:<port>,<host-or-ip>:<port>
 
 Use `host:port` or `[ipv6]:port`. An IPv6 endpoint format does not imply IPv6 WARP egress support.
 
-Daily refresh is disabled by default; add `--enable-refresh-timer` during installation to enable it. The default `CFWARP_ENDPOINT_REFRESH_ACTIVE_MODE=skip` skips refresh while the main service is active. The timer does not stop the service by default.
+Daily refresh is disabled by default; add `--enable-refresh-timer` during installation to enable it. The default `CFWARP_ENDPOINT_REFRESH_ACTIVE_MODE=skip` skips refresh while the main service is running, starting, or stopping. The timer does not stop the service by default. `stop-and-probe` waits for confirmed shutdown before probing; failed state reads abort the operation.
 
 Only when interrupting the active service for evaluation is intended, set:
 
@@ -361,6 +363,8 @@ CFWARP_ENDPOINT_REFRESH_ACTIVE_MODE=stop-and-probe
 Probes reuse one WireGuard identity and run sequentially to avoid interfering with each other. Candidates have bounded execution time; shutdown stops probing before cleaning resources. When the current endpoint is healthy, switching requires the improvement threshold to be met. When it is unavailable, a verified working candidate may be selected. If service recovery fails, refresh attempts to restore the old configuration. Measurements compare candidates at that time; they do not establish long-term bandwidth or reliability.
 
 If switch verification, configuration restoration, or probe cleanup fails, originals, logs, and `RECOVERY.txt` remain in `recovery/endpoint-refresh-*` under the data directory (default `/var/lib/cfwarp/recovery`). Directories use mode 0700 and files mode 0600; logs identify the specific path. Incomplete configuration restoration prevents automatic restart. Follow the instructions and verify recovery before deleting that run's directory. Backups contain credentials; do not publish or source them as Shell code.
+
+The main service and refresh share `.service-probe.lock` in the data directory. Startup is refused during probing; normal refresh releases the lock after probe cleanup and before restoring the service. A remaining `.refresh-pending` also blocks later starts and refreshes and points to recovery instructions. Clean residual probe interfaces using their ownership state and complete configuration restoration before removing the marker. Do not delete it merely to force startup. Stop services through `systemctl stop`; directly invoking cleanup cannot bypass a running controller's lock.
 
 Trigger manually and inspect logs:
 

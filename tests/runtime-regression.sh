@@ -330,7 +330,7 @@ if command -v setsid >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1 && co
     # shellcheck disable=SC1090
     . "$ROOT/lib/cfwarp-common.sh"
     [ "$(cfwarp_read_env_key ENDPOINT_IP "$CFWARP_ENV_FILE")" = 192.0.2.30:2408 ] || fail 'unhealthy current endpoint retained'
-    [ "$(cat "$TMP/network-events")" = "$(printf 'up\ndown\nup\ndown')" ] || fail 'probe namespaces overlapped'
+    [ "$(cat "$TMP/network-events")" = "$(printf 'down\nup\ndown\nup\ndown')" ] || fail 'probe namespaces overlapped'
     if CFWARP_MODE=netns-proxy ENDPOINT_IP=192.0.2.20:2408 ENDPOINT_CANDIDATES='' FAKE_SLEEP=1 \
         sh "$TMP/project/cfwarp-refresh-endpoint.sh" > "$TMP/timeout.out" 2>&1; then fail 'timed out candidates passed refresh'; fi
     [ ! -e "$TMP/netns-active" ] || fail 'timeout leaked namespace'

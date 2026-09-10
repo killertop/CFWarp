@@ -19,6 +19,7 @@ sed 's@\[ -d /run/systemd/system \]@true@' "$REFRESH_UNDER_TEST" > "$TMP/project
 cat > "$TMP/project/cfwarp-netns.sh" <<'STUB'
 #!/bin/sh
 set -eu
+case "${NETNS_NAME:-}" in cfpr*) ;; *) exit 0 ;; esac
 case "$1" in
     up) touch "$CASE_ROOT/probe-kernel-live" ;;
     down)

@@ -71,6 +71,7 @@ case "$1" in
         if [ "$kind" = probe ]; then rm -f "$CASE_ROOT/hold-post"; fi
         ;;
     down)
+        if [ "$kind" = main ] && [ -e "$CASE_ROOT/fail-main-cleanup" ]; then exit 1; fi
         if [ "$kind" = probe ] && [ -e "$CASE_ROOT/fail-cleanup" ]; then exit 1; fi
         rm -f "$CASE_ROOT/$kind-kernel"
         ;;
@@ -177,13 +178,22 @@ esac
         self.wait_for(lambda: (self.base / "main-active").exists())
         self.stop(main)
 
+    def test_failed_main_cleanup_blocks_probe_identity_reuse(self):
+        (self.base / "main-kernel").touch()
+        (self.base / "fail-main-cleanup").touch()
+        result = self.run_script("cfwarp-refresh-endpoint.sh")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.base / "probe-kernel").exists())
+        self.assertTrue((self.base / "main-kernel").exists())
+        self.assertTrue((self.data / ".refresh-pending").exists())
+
     @unittest.skipUnless(LIVE, "--live enables real systemd transitions")
     def test_systemd_activating_stop_restore_and_failed_cleanup(self):
         self.assertEqual(os.geteuid(), 0, "--live needs root in a disposable VM")
         (self.bin / "systemctl").unlink()
         self.unit = f"cfwarp-lifecycle-{os.getpid()}.service"
         self.env["CFWARP_SERVICE_NAME"] = self.unit
-        self.write(self.base / "post.sh", '#!/bin/sh\nwhile [ -e "$CASE_ROOT/hold-post" ]; do sleep 0.1; done\n')
+        self.write(self.base / "post.sh", '#!/bin/sh\nwhile [ -e "$CASE_ROOT/hold-post" ] || [ ! -e "$CASE_ROOT/main-active" ]; do sleep 0.1; done\n')
         unit_path = self.base / self.unit
         unit_path.write_text(f'''[Unit]
 StartLimitIntervalSec=0
@@ -220,7 +230,7 @@ SuccessExitStatus=143
         self.assertTrue((self.base / "probe-kernel").exists())
         self.assertTrue((self.data / ".refresh-pending").exists())
         result = subprocess.run(["systemctl", "start", self.unit], capture_output=True)
-        self.assertNotEqual(result.returncode, 0)
+        self.wait_for(lambda: state() == "failed")
         self.assertFalse((self.base / "main-active").exists())
 
 

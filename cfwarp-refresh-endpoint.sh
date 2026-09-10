@@ -191,6 +191,10 @@ acquire_refresh_guard() {
     fi
     printf '%s\n' "$TMP_ROOT/RECOVERY.txt" | cfwarp_atomic_write_from_stdin "$CFWARP_REFRESH_PENDING" || return 1
     REFRESH_GUARD_OWNED=1
+    # A failed service may be process-free but still have owned kernel state.
+    # Finish that cleanup under the gate before reusing its WireGuard identity.
+    CFWARP_ENV_LOADED=1 CFWARP_MODE=netns-proxy \
+        sh "$SCRIPT_DIR/cfwarp-netns.sh" down >> "$RECOVERY_LOG" 2>&1 || return 1
 }
 
 release_refresh_guard() {

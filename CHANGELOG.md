@@ -2,6 +2,15 @@
 
 ## 2026-09-10
 
+### 刷新生命周期修复 / Refresh lifecycle fixes
+
+- 刷新识别主服务启动/停止等过渡状态，停止后再次确认；状态未知时拒绝探测。
+- 主服务、清理入口与刷新使用同一生命周期锁，关闭检查之后的并发启动窗口。
+- 探测清理失败禁止恢复主服务，并保留阻断标记和恢复材料；后续进程也必须先完成恢复。
+- Refresh recognizes starting/stopping and other transitional states, confirms shutdown, and refuses probing when state cannot be read.
+- Main startup, cleanup, and refresh share a lifecycle lock to prevent starts racing a prior service-state check.
+- Failed probe cleanup blocks main restoration and retains a startup-blocking marker and recovery material for later processes.
+
 ### 发布前再次审查 / Additional pre-publish review
 
 - 修复升级漏停启动中的 oneshot：等待辅助服务退出后重新检查主服务，停服完成后才发布 MicroSOCKS；取消按接口名清理的升级补偿。
