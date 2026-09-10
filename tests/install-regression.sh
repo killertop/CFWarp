@@ -169,7 +169,10 @@ awk '
     # shellcheck disable=SC1091
     . "$TMP_DIR/live-upgrade-functions.sh"
     systemd_available() { return 0; }
+    # Used by publish_microsocks in the extracted installer functions.
+    # shellcheck disable=SC2034
     BIN_DIR="$TMP_DIR/upgrade-bin"
+    # shellcheck disable=SC2034
     CFWARP_MICROSOCKS_STAGED="$TMP_DIR/upgrade-bin/staged"
     stop_for_upgrade || exit 1
     test "$SERVICE_WAS_ACTIVE" = 1 || exit 1
