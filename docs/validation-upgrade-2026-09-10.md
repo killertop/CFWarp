@@ -2,6 +2,10 @@
 
 日期 / Date: 2026-09-10
 
+后续复查发现刷新过渡状态与失败恢复缺口，修复及新验收见[刷新生命周期记录](validation-refresh-2026-09-10.md)。本页保留为历史证据。
+
+Later review identified refresh transition-state and recovery gaps. See the [refresh lifecycle record](validation-refresh-2026-09-10.md) for fixes and new acceptance; this page remains historical evidence.
+
 运行代码 / Runtime: [`5280b4e`](https://github.com/killertop/CFWarp/commit/5280b4e)
 
 ## 中文
