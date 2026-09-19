@@ -1,8 +1,8 @@
-# CFWarp
+# CFWarp — Cloudflare WARP SOCKS5 Proxy for Linux
 
-**为指定 Linux 应用提供 Cloudflare WARP 出站，不接管宿主机默认路由。**
+**Linux 服务器上的 Cloudflare WARP SOCKS5 代理：按应用选择 WARP 出口，默认保留宿主机路由。**
 
-**Cloudflare WARP egress for selected Linux applications, without taking over the host default route.**
+**Route selected Linux applications through Cloudflare WARP with a TCP SOCKS5 proxy, WireGuard, and an isolated network namespace. Preserve the host default route by default.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![CI](https://github.com/killertop/CFWarp/actions/workflows/ci.yml/badge.svg)](https://github.com/killertop/CFWarp/actions/workflows/ci.yml)
@@ -11,7 +11,7 @@
 
 ## 中文
 
-### 这个项目做什么
+### Linux 上的 Cloudflare WARP SOCKS5 代理
 
 CFWarp 将 Cloudflare WARP 封装为 Linux 服务器上的 **TCP SOCKS5 出站代理**。默认模式把 WARP 隧道和代理放进独立的 network namespace（网络命名空间）；只有配置了代理的应用，或通过 `cfwarp-exec` 启动的命令，使用这条出口。
 
@@ -22,7 +22,14 @@ CFWarp 将 Cloudflare WARP 封装为 Linux 服务器上的 **TCP SOCKS5 出站�
 其他宿主机应用 → 原有默认出口
 ```
 
-### 对用户的价值
+### 适合哪些使用场景
+
+- **Linux VPS 按应用代理**：让指定后端服务使用 WARP 出口，其他宿主机应用继续使用原有默认出口。
+- **命令行与脚本联网**：为支持 SOCKS5 的 curl 请求、下载工具和自动化脚本配置代理，并通过 `socks5h` 在代理端解析域名。
+- **不支持代理配置的程序**：通过 `cfwarp-exec` 在 WARP 网络命名空间内启动命令，需要 root 权限。
+- **长期运行的服务器服务**：使用 systemd、健康检查和 watchdog 管理代理及隧道状态。
+
+### 核心功能：按应用路由、DNS 与故障出口保护
 
 - **按应用选择出口**：默认不替换宿主机默认路由，便于在一台服务器上同时运行使用不同出口的服务。
 - **故障时阻止直连回落**：默认 namespace 模式在隧道就绪前、接口或路由丢失时阻断应用直连；应用 DNS 也通过隧道发送。
@@ -38,7 +45,7 @@ CFWarp 将 Cloudflare WARP 封装为 Linux 服务器上的 **TCP SOCKS5 出站�
 
 可选的 `host-global` 模式会改变宿主机 IPv4 路由，不提供 namespace 模式的故障出口阻断，仅在明确需要整机出口时启用。实际连通性、速度和出口位置取决于服务器网络、WARP 及目标服务；项目不保证某个服务可访问，也没有固定内存或性能承诺。
 
-### 快速开始
+### 快速开始：安装 WARP SOCKS5 代理
 
 ```bash
 git clone https://github.com/killertop/CFWarp.git
@@ -84,9 +91,23 @@ sudo /opt/cfwarp/bin/cfwarp env
 
 更多配置、DNS、认证、自定义路径、Endpoint 管理和清理步骤见 [使用说明](USAGE.md#中文)。语言选择及验证边界见 [架构说明](docs/architecture.md#中文)。
 
+### 常见问题
+
+#### 如何只让一个 Linux 应用使用 Cloudflare WARP？
+
+在默认 `netns-proxy` 模式下，将该应用的 SOCKS5 代理配置为 `169.254.240.2:1080`。对于支持 URL 形式代理的客户端，使用 `socks5h://169.254.240.2:1080` 可将目标域名交给代理端解析。完整示例见 [按应用使用 WARP](USAGE.md#3-默认模式按应用使用)。
+
+#### CFWarp 会修改服务器默认路由吗？
+
+默认模式保留宿主机默认路由，在独立网络命名空间中配置 WARP 路由；安装仍会创建 veth 和转发/NAT 规则。可选 `host-global` 模式会修改宿主机 IPv4 路由，详见 [全局出口配置](USAGE.md#5-可选模式宿主机全局出口)。
+
+#### 支持 UDP、IPv6 出站或 Docker 部署吗？
+
+当前支持 TCP SOCKS5 和 IPv4 WARP 出站，不提供 UDP 代理或 IPv6 WARP 出站。部署使用 Linux 与 systemd，无需 Docker；项目目前不提供 Docker/Compose 镜像。完整边界见 [项目范围](PROJECT.md#中文)。
+
 ## English
 
-### What it does
+### Cloudflare WARP as a Linux SOCKS5 proxy
 
 CFWarp exposes Cloudflare WARP as a **TCP SOCKS5 egress proxy for Linux servers**. By default, the WARP tunnel and proxy run inside a separate network namespace. Applications use this egress when configured to use the proxy, or when launched through `cfwarp-exec`.
 
@@ -97,7 +118,14 @@ Selected app → SOCKS5 → separate network namespace → WireGuard → Cloudfl
 Other host apps → existing default egress
 ```
 
-### Why use it
+### Use cases
+
+- **Per-app proxy on a Linux VPS:** send a selected backend service through WARP while other host applications retain their existing default egress.
+- **Command-line tools and scripts:** configure SOCKS5 for curl requests, compatible download tools, and automation scripts; use `socks5h` for proxy-side DNS resolution.
+- **Programs without proxy settings:** launch commands inside the WARP network namespace with `cfwarp-exec`, which requires root.
+- **Long-running server services:** manage the proxy and tunnel with systemd, health checks, and a recovery watchdog.
+
+### Features: per-app routing, DNS, and fail-closed egress
 
 - **Choose egress per application.** The default mode preserves the host default route, allowing services with different egress requirements to share a server.
 - **Block direct fallback on failure.** Default namespace mode blocks direct application egress before tunnel readiness and if its interface or routes disappear. Application DNS also uses the tunnel.
@@ -113,7 +141,7 @@ The current scope is **IPv4 WARP egress and TCP SOCKS5**. It does not include UD
 
 The optional `host-global` mode changes host IPv4 routing and does not provide namespace mode's fail-closed egress protection. Enable it only when host-wide egress is intended. Connectivity, speed, and egress location depend on the server network, WARP, and the destination service. No fixed resource footprint, performance, or access to a particular service is guaranteed.
 
-### Quick start
+### Quick start: install the WARP SOCKS5 proxy
 
 ```bash
 git clone https://github.com/killertop/CFWarp.git
@@ -158,6 +186,20 @@ sudo /opt/cfwarp/bin/cfwarp env
 ```
 
 See [Usage](USAGE.md#english) for DNS, authentication, custom paths, endpoint management, and cleanup. See [Architecture](docs/architecture.md#english) for the language decision and validation boundaries.
+
+### Frequently asked questions
+
+#### How do I use Cloudflare WARP for only one Linux application?
+
+In default `netns-proxy` mode, set that application's SOCKS5 proxy to `169.254.240.2:1080`. Clients accepting proxy URLs can use `socks5h://169.254.240.2:1080` to resolve destination names at the proxy. See [per-application WARP configuration](USAGE.md#3-default-mode-per-application-egress) for examples.
+
+#### Does CFWarp change the server's default route?
+
+Default mode preserves the host default route and configures WARP routing inside an isolated network namespace. Setup still creates veth devices and forwarding/NAT rules. Optional `host-global` mode changes host IPv4 routing; see [host-wide egress configuration](USAGE.md#5-optional-host-wide-egress).
+
+#### Does it support UDP, IPv6 egress, or Docker deployment?
+
+CFWarp currently supports TCP SOCKS5 and IPv4 WARP egress, without UDP proxying or IPv6 WARP egress. Deployment uses Linux and systemd with no Docker requirement; the project does not currently provide Docker/Compose images. See [project scope](PROJECT.md#english) for details.
 
 ## License
 
