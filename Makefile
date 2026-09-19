@@ -10,6 +10,9 @@ test: check
 	@sh tests/network-refcount-regression.sh
 	@sh tests/install-refusal-regression.sh
 	@sh tests/install-upgrade-regression.sh
+	@python3 tests/install-lock-regression.py
+	@python3 tests/install-preflight-regression.py
+	@python3 tests/watchdog-regression.py
 	@sh tests/refresh-recovery-regression.sh
 	@python3 tests/refresh-lifecycle-regression.py
 
@@ -18,3 +21,4 @@ integration: test
 	@sudo python3 tests/network-egress-regression.py --live
 	@sudo sh tests/install-regression.sh --live
 	@sudo python3 tests/refresh-lifecycle-regression.py --live
+	@sudo python3 tests/install-preflight-regression.py --live

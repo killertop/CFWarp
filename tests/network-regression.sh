@@ -13,6 +13,8 @@ fi
 }
 for tool in ip iptables ip6tables sysctl flock curl; do command -v "$tool" >/dev/null; done
 TMP_DIR=$(mktemp -d /tmp/cfwarp-net-test.XXXXXX)
+CFWARP_DATA_DIR="$TMP_DIR/data"
+export CFWARP_DATA_DIR
 TEST_TAG=cft$$
 REAL_IP=$(command -v ip)
 REAL_SYSCTL=$(command -v sysctl)
@@ -158,6 +160,32 @@ printf 'nameserver 1.1.1.1\nnameserver 1.0.0.1\n' > "$TMP_DIR/expected-dns"
 cmp "$TMP_DIR/expected-dns" "/etc/netns/${TEST_TAG}a/resolv.conf"
 # Inode checks reject stale state, and absent state performs no cleanup at all.
 cp "$TMP_DIR/state/${TEST_TAG}a.env" "$TMP_DIR/state.backup"
+for conflicting_action in up down; do
+    if (CFWARP_DATA_DIR="$TMP_DIR/other-data"; export CFWARP_DATA_DIR; run_netns a "$conflicting_action") > "$TMP_DIR/owner-conflict.log" 2>&1; then
+        echo 'FAIL: another data directory took over a live namespace' >&2
+        exit 1
+    fi
+    cmp "$TMP_DIR/state.backup" "$TMP_DIR/state/${TEST_TAG}a.env"
+    [ -e "/run/netns/${TEST_TAG}a" ]
+    [ "$(cat "$TMP_DIR/global/ip_forward.refs")" = 1 ]
+done
+mkdir -p "$TMP_DIR/collision/lib"
+cp "$ROOT_DIR/cfwarp-start.sh" "$ROOT_DIR/cfwarp-netns.sh" "$TMP_DIR/collision/"
+cp "$ROOT_DIR/lib/cfwarp-common.sh" "$TMP_DIR/collision/lib/"
+printf '#!/bin/sh\nexit 0\n' > "$TMP_DIR/collision/entrypoint.sh"
+if env CFWARP_ENV_LOADED=1 PATH="$TMP_DIR/bin:$PATH" \
+    CFWARP_DATA_DIR="$TMP_DIR/other-data" \
+    CFWARP_STATE_DIR="$TMP_DIR/state" CFWARP_GLOBAL_STATE_DIR="$TMP_DIR/global" \
+    NETNS_NAME="${TEST_TAG}a" NETNS_HOST_IF="${TEST_TAG}ah" NETNS_NS_IF="${TEST_TAG}an" \
+    WG_INTERFACE=wgtest WG_CONF="$TMP_DIR/wgtest.conf" \
+    sh "$TMP_DIR/collision/cfwarp-start.sh" > "$TMP_DIR/owner-start-conflict.log" 2>&1; then
+    echo 'FAIL: conflicting controller startup succeeded' >&2
+    exit 1
+fi
+cmp "$TMP_DIR/state.backup" "$TMP_DIR/state/${TEST_TAG}a.env"
+[ -e "/run/netns/${TEST_TAG}a" ]
+[ "$(cat "$TMP_DIR/global/ip_forward.refs")" = 1 ]
+echo 'PASS: foreign data directory up/down and failed controller cleanup preserve the owner'
 sed -i 's/^NS_INODE=.*/NS_INODE=1/' "$TMP_DIR/state/${TEST_TAG}a.env"
 if run_netns a down > "$TMP_DIR/stale.log" 2>&1; then exit 1; fi
 [ -e "/run/netns/${TEST_TAG}a" ]

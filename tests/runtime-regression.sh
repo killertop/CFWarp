@@ -19,9 +19,13 @@ case "$1" in
     up)
         [ ! -e "$FAKE_ROOT/netns-active" ] || { echo concurrent_probe >&2; exit 1; }
         touch "$FAKE_ROOT/netns-active"
+        printf '%s\n' "$CFWARP_DATA_DIR" > "$FAKE_ROOT/netns-owner"
         printf 'up\n' >> "$FAKE_ROOT/network-events"
         ;;
     down)
+        if [ -e "$FAKE_ROOT/netns-active" ]; then
+            [ "$(cat "$FAKE_ROOT/netns-owner")" = "$CFWARP_DATA_DIR" ] || { echo foreign_namespace_owner >&2; exit 1; }
+        fi
         if [ -e "$FAKE_ROOT/child-pid" ]; then
             status=$(ps -o stat= -p "$(cat "$FAKE_ROOT/child-pid")" 2>/dev/null || true)
             case "$status" in ''|*Z*) ;; *) echo live_child_at_teardown >> "$FAKE_ROOT/network-events"; exit 1 ;; esac

@@ -6,7 +6,7 @@ COMMON_FILE="${SCRIPT_DIR}/lib/cfwarp-common.sh"
 [ -r "$COMMON_FILE" ] || { echo "==> [ERROR] 找不到共享库: $COMMON_FILE" >&2; exit 1; }
 # shellcheck disable=SC1090
 . "$COMMON_FILE"
-cfwarp_load_env "$SCRIPT_DIR" || exit 1
+cfwarp_load_env "$SCRIPT_DIR" required || exit 1
 [ -r "$CFWARP_ENV_FILE" ] || { echo "==> [ERROR] 未找到可读的环境文件: $CFWARP_ENV_FILE" >&2; exit 1; }
 
 CFWARP_MODE=${CFWARP_MODE:-netns-proxy}
@@ -104,6 +104,7 @@ PROBE_STATE_DIR="${CFWARP_ENDPOINT_REFRESH_STATE_ROOT}/probe-${PROBE_TOKEN}"
 ACTIVE_PROBE_PID=
 PROBE_NETWORK_DIRTY=0
 PROBE_WG_CONF="${TMP_ROOT}/${PROBE_WG_IF}.conf"
+PROBE_DATA_DIR=$TMP_ROOT
 SERVICE_NEEDS_RESTORE=0
 CFWARP_CAN_RESTART=1
 LIFECYCLE_LOCKED=0
@@ -137,6 +138,7 @@ stop_probe_processes() {
 cleanup_probe_network() {
     [ "$PROBE_NETWORK_DIRTY" = "1" ] || return 0
     if CFWARP_ENV_LOADED=1 CFWARP_MODE=netns-proxy \
+        CFWARP_DATA_DIR="$PROBE_DATA_DIR" \
         NETNS_NAME="$PROBE_NETNS" NETNS_HOST_IF="$PROBE_HOST_IF" NETNS_NS_IF="$PROBE_NS_IF" \
         CFWARP_STATE_DIR="$PROBE_STATE_DIR" \
         NETNS_HOST_ADDR="169.254.241.$((PROBE_SUBNET_BASE + 1))/30" \
@@ -406,6 +408,7 @@ while IFS= read -r CANDIDATE_ENDPOINT; do
     install -d -m 0700 "$CANDIDATE_DIR"
     CANDIDATE_CONF="${CANDIDATE_DIR}/${PROBE_WG_IF}.conf"
     PROBE_WG_CONF=$CANDIDATE_CONF
+    PROBE_DATA_DIR=$CANDIDATE_DIR
     CANDIDATE_METRICS="${CANDIDATE_DIR}/metrics.env"
     install -m 0600 "${TMP_ROOT}/original-wg.conf" "$CANDIDATE_CONF"
     echo "==> [CFwarp] 正在评估 Endpoint: $CANDIDATE_ENDPOINT"

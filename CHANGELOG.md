@@ -1,5 +1,22 @@
 # 更新记录 / Changelog
 
+## 2026-09-19
+
+### 运行安全与升级保护 / Runtime and upgrade safeguards
+
+- 安装器拒绝在 systemd 清理失败后替换或移除运行文件，`--force` 不绕过此检查。
+- 安装与直接 CLI 刷新共用新旧配置对应的刷新/生命周期锁，在启动服务前释放；锁冲突或待恢复标记存在时拒绝变更。
+- 在停服前暂存并校验私有 `wg-quick`，失败时保留原服务和原文件。
+- namespace 状态记录规范化数据目录，拒绝其他实例接管或清理；状态格式升至 v3，升级前由旧运行文件清理 v2 状态。
+- 启动和刷新要求显式或安装记录指定的配置文件存在且可读，避免配置丢失后静默回退；已有进程的配置快照及诊断入口保持可用。
+- watchdog 使用条件重启并拒绝替换已排队的停止任务，尊重健康检查期间的手动停服。
+- Installers preserve runtime files when systemd cleanup fails, including with `--force`.
+- Installation and direct CLI refresh share refresh/lifecycle locks for both old and new configuration paths. Release gates before service startup; refuse changes on contention or pending recovery.
+- Stage and validate private `wg-quick` before stopping services, preserving the old service and executable on preparation failure.
+- Namespace state now records the canonical data directory and rejects foreign owners. State format is v3; the previous runtime must clean v2 state before upgrading.
+- Startup and refresh require explicitly selected or installed configuration files to be readable, preventing silent fallback after configuration loss. Existing process snapshots and diagnostics remain available.
+- The watchdog uses conditional restart without replacing queued stop jobs, respecting manual stops during health checks.
+
 ## 2026-09-10
 
 ### 刷新生命周期修复 / Refresh lifecycle fixes

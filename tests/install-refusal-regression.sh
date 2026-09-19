@@ -22,6 +22,8 @@ set -eu
 # shellcheck disable=SC1091
 . "$TEST_ROOT/cleanup-function.sh"
 require_root() { :; }
+acquire_install_runtime_locks() { :; }
+release_install_runtime_locks() { :; }
 systemd_available() { return 0; }
 acquire_install_lock() {
     printf 'lock\n' >> "$TEST_CASE/mutations"
@@ -52,7 +54,7 @@ systemctl() {
                     [ "${TEST_RESTORE_ON_REFRESH_STOP:-0}" = 1 ]; then
                     printf 'active\n' > "$TEST_CASE/state/cfwarp.service"
                 fi
-                printf 'inactive\n' > "$TEST_CASE/state/$unit"
+                printf '%s\n' "${TEST_STOP_RESULT:-inactive}" > "$TEST_CASE/state/$unit"
             done
             ;;
         disable)
@@ -166,4 +168,17 @@ for unit in $UNITS; do
     [ "$(cat "$TEST_CASE/state/$unit.enabled")" = disabled ] || fail 'forced cleanup left an enabled unit'
 done
 [ ! -e "$TEST_CASE/runtime/lib/cfwarp-common.sh" ] || fail 'forced cleanup retained generated library'
+unset TEST_RESTORE_ON_REFRESH_STOP
+for initial_state in active failed; do
+    prepare_case "cleanup-failed-$initial_state"
+    printf '%s\n' "$initial_state" > "$TEST_CASE/state/cfwarp.service"
+    cp -R "$TEST_CASE/runtime" "$TEST_CASE/runtime-before"
+    cp -R "$TEST_CASE/units" "$TEST_CASE/units-before"
+    TEST_STOP_RESULT=failed
+    export TEST_STOP_RESULT
+    if run_cleanup 1; then fail '--force ignored failed resource cleanup'; fi
+    unset TEST_STOP_RESULT
+    diff -r "$TEST_CASE/runtime-before" "$TEST_CASE/runtime" >/dev/null || fail 'failed cleanup removed runtime files'
+    diff -r "$TEST_CASE/units-before" "$TEST_CASE/units" >/dev/null || fail 'failed cleanup removed units'
+done
 echo 'CFwarp installation refusal regressions passed'

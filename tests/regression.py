@@ -71,6 +71,39 @@ class Regression(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout, "|3|from file|1")
 
+    def test_required_env_rejects_missing_and_dangling_files(self):
+        missing = self.base / "missing.env"
+        dangling = self.base / "dangling.env"
+        dangling.symlink_to(missing)
+        for config in (missing, dangling):
+            env = self.env | {"CFWARP_ENV_FILE": str(config)}
+            result = self.shell('cfwarp_load_env "$1" required', ROOT, env=env)
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            self.assertIn("missing or not readable", result.stderr)
+
+    def test_installed_start_rejects_lost_config_before_bootstrap(self):
+        installed = self.base / "installed"
+        (installed / "lib").mkdir(parents=True)
+        (installed / "deploy").mkdir()
+        for name in ("cfwarp-start.sh", "entrypoint.sh", "lib/cfwarp-common.sh"):
+            (installed / name).write_text((ROOT / name).read_text())
+        missing = self.base / "lost-private.env"
+        (installed / "deploy/installation.env").write_text(f"CFWARP_ENV_FILE='{missing}'\n")
+        env = self.env | {"CFWARP_TEST_MODE": "1"}
+        env.pop("CFWARP_ENV_FILE")
+        for name in ("cfwarp-start.sh", "entrypoint.sh"):
+            result = subprocess.run(["sh", str(installed / name)], env=env,
+                                    capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            self.assertIn("missing or not readable", result.stderr)
+            self.assertFalse((installed / "var").exists())
+
+    def test_loaded_snapshot_remains_available_for_cleanup(self):
+        env = self.env | {"CFWARP_ENV_LOADED": "1", "CFWARP_DATA_DIR": str(self.base / "original")}
+        result = self.shell('cfwarp_load_env "$1" required && printf "%s" "$CFWARP_DATA_DIR"', ROOT, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, str(self.base / "original"))
+
     def test_marker_config_and_process_precedence(self):
         (self.base / "deploy").mkdir()
         config = self.base / "private.env"
@@ -152,6 +185,7 @@ class Regression(unittest.TestCase):
         self.assertNotIn("install.sh", r.stderr)
 
     def test_scanner_errors_fail_closed(self):
+        Path(self.env["CFWARP_ENV_FILE"]).touch()
         mock = self.base / "bin"
         mock.mkdir()
         (mock / "rg").write_text("#!/bin/sh\nexit 2\n")

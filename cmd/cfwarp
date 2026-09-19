@@ -33,7 +33,10 @@ EOF
 COMMAND=${1:-help}
 [ "$#" -eq 0 ] || shift
 case "$COMMAND" in help|-h|--help) usage; exit 0 ;; esac
-cfwarp_load_env "$SCRIPT_DIR"
+case "$COMMAND" in
+    start|restart|refresh|exec) cfwarp_load_env "$SCRIPT_DIR" required ;;
+    *) cfwarp_load_env "$SCRIPT_DIR" ;;
+esac
 CFWARP_SERVICE_NAME=${CFWARP_SERVICE_NAME:-cfwarp.service}
 case "$COMMAND" in
     start|stop|restart|status)

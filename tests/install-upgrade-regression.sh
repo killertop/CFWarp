@@ -22,6 +22,7 @@ cat > "$TMP_DIR/upgrade-harness.sh" <<'HARNESS'
 set -eu
 # shellcheck disable=SC1091
 . "$TEST_ROOT/upgrade-functions.sh"
+release_install_runtime_locks() { :; }
 systemd_available() { return 0; }
 systemctl() {
     command=$1
@@ -47,7 +48,7 @@ systemctl() {
                 touch "$TEST_CASE/foreign-wg0"
             fi
             if [ "${TEST_REMAIN_BUSY:-}" != "$unit" ]; then
-                printf 'inactive\n' > "$TEST_CASE/state/$unit"
+                printf '%s\n' "${TEST_STOP_RESULT:-inactive}" > "$TEST_CASE/state/$unit"
             fi
             ;;
         *) echo "unexpected systemctl command: $command" >&2; return 1 ;;
@@ -156,6 +157,20 @@ export TEST_REMAIN_BUSY
 if run_upgrade; then fail 'successful stop reply concealed a still-busy helper'; fi
 unset TEST_REMAIN_BUSY
 cmp "$TEST_CASE/bin/microsocks" "$TEST_CASE/old-binary" || fail 'busy helper allowed binary replacement'
+
+# Test the real lock function against a private stand-in for /run.
+for initial_state in active failed; do
+    prepare_case "cleanup-failed-$initial_state"
+    printf '%s\n' "$initial_state" > "$TEST_CASE/state/cfwarp.service"
+    TEST_STOP_RESULT=failed
+    export TEST_STOP_RESULT
+    if run_upgrade; then fail 'failed cleanup permitted upgrade'; fi
+    unset TEST_STOP_RESULT
+    cmp "$TEST_CASE/bin/microsocks" "$TEST_CASE/old-binary" || fail 'failed cleanup replaced runtime'
+    if grep -Fx publish "$TEST_CASE/events" >/dev/null; then fail 'failed cleanup published files'; fi
+    printf 'inactive\n' > "$TEST_CASE/state/cfwarp.service"
+    run_upgrade || fail 'verified recovery did not permit retry'
+done
 
 # Test the real lock function against a private stand-in for /run.
 # Substituting the system path keeps tests from changing real system paths.

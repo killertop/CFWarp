@@ -10,7 +10,10 @@ if [ ! -r "$COMMON_FILE" ]; then
 fi
 # shellcheck disable=SC1090
 . "$COMMON_FILE"
-cfwarp_load_env "$SCRIPT_DIR"
+case "$ACTION" in
+    up|exec) cfwarp_load_env "$SCRIPT_DIR" required ;;
+    *) cfwarp_load_env "$SCRIPT_DIR" ;;
+esac
 
 CFWARP_MODE=${CFWARP_MODE:-netns-proxy}
 NETNS_NAME=${NETNS_NAME:-cfwarp}
@@ -24,6 +27,7 @@ NETNS_DNS_SERVERS=${NETNS_DNS_SERVERS:-1.1.1.1 1.0.0.1}
 CFWARP_STATE_DIR=${CFWARP_STATE_DIR:-/run/cfwarp}
 CFWARP_GLOBAL_STATE_DIR=${CFWARP_GLOBAL_STATE_DIR:-/run/cfwarp}
 CFWARP_DATA_DIR=${CFWARP_DATA_DIR:-${SCRIPT_DIR}/var}
+CFWARP_OWNER_DATA_DIR=$(readlink -m -- "$CFWARP_DATA_DIR")
 WG_INTERFACE=${WG_INTERFACE:-wg0}
 WG_CONF_DIR=${WG_CONF_DIR:-$CFWARP_DATA_DIR}
 WG_CONF=${WG_CONF:-${WG_CONF_DIR}/${WG_INTERFACE}.conf}
@@ -70,7 +74,8 @@ validate_config() {
     done
     case "$WG_CONF" in /*) ;; *) fail 'WG_CONF 必须为绝对路径。'; return 1 ;; esac
     [ "$(basename "$WG_CONF")" = "${WG_INTERFACE}.conf" ] || { fail 'WG_CONF 文件名必须与 WG_INTERFACE 一致。'; return 1; }
-    for CFWARP_PATH in "$WG_CONF" "$CFWARP_STATE_DIR" "$CFWARP_GLOBAL_STATE_DIR"; do
+    case "$CFWARP_DATA_DIR" in /*) ;; *) fail 'CFWARP_DATA_DIR 必须为绝对路径。'; return 1 ;; esac
+    for CFWARP_PATH in "$WG_CONF" "$CFWARP_STATE_DIR" "$CFWARP_GLOBAL_STATE_DIR" "$CFWARP_OWNER_DATA_DIR"; do
         case "$CFWARP_PATH" in *'
 '*) fail '配置路径不能包含换行。'; return 1 ;; esac
     done
@@ -293,7 +298,8 @@ write_state_file() {
     sync_forward_held || return 1
     # This is data, never sourced as shell code. Newlines were rejected above.
     cfwarp_atomic_write_from_stdin "$STATE_FILE" <<EOF_STATE
-VERSION=2
+VERSION=3
+OWNER_DATA_DIR=$CFWARP_OWNER_DATA_DIR
 NETNS_NAME=$NETNS_NAME
 NETNS_HOST_IF=$NETNS_HOST_IF
 NETNS_NS_IF=$NETNS_NS_IF
@@ -322,8 +328,12 @@ state_value() {
 
 load_state() {
     [ -r "$STATE_FILE" ] || return 1
-    [ "$(state_value VERSION)" = 2 ] || {
+    [ "$(state_value VERSION)" = 3 ] || {
         fail "旧版本或无效的网络状态: $STATE_FILE；请先用创建它的版本停止服务。"
+        return 1
+    }
+    [ "$(state_value OWNER_DATA_DIR)" = "$CFWARP_OWNER_DATA_DIR" ] || {
+        fail '网络状态属于其他数据目录，拒绝接管或清理。'
         return 1
     }
     [ "$(state_value NETNS_NAME)" = "$NETNS_NAME" ] || { fail '状态 namespace 不匹配。'; return 1; }

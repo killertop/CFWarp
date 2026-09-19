@@ -83,12 +83,16 @@ cfwarp_import_env() {
 cfwarp_load_env() {
     [ "${CFWARP_ENV_LOADED:-0}" = 1 ] && return 0
     CFWARP_LOAD_DIR=$1
+    CFWARP_REQUIRE_ENV=0
+    if [ "${2:-}" = required ] && { [ -n "${CFWARP_ENV_FILE:-}" ] || [ -e "$CFWARP_LOAD_DIR/deploy/installation.env" ]; }; then
+        CFWARP_REQUIRE_ENV=1
+    fi
     CFWARP_ENV_FILE=$(cfwarp_default_env_file "$CFWARP_LOAD_DIR") || return 1
     export CFWARP_ENV_FILE
     if [ -r "$CFWARP_ENV_FILE" ]; then
         cfwarp_import_env "$CFWARP_ENV_FILE" || return 1
-    elif [ -e "$CFWARP_ENV_FILE" ]; then
-        echo "==> [ERROR] Environment file is not readable: $CFWARP_ENV_FILE" >&2
+    elif [ -e "$CFWARP_ENV_FILE" ] || [ -L "$CFWARP_ENV_FILE" ] || [ "$CFWARP_REQUIRE_ENV" = 1 ]; then
+        echo "==> [ERROR] Environment file is missing or not readable: $CFWARP_ENV_FILE" >&2
         return 1
     fi
     if [ -r "$CFWARP_LOAD_DIR/deploy/installation.env" ]; then

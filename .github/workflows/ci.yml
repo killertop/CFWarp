@@ -37,3 +37,5 @@ jobs:
         run: git diff --check
       - name: Refresh lifecycle and systemd transitions
         run: sudo python3 tests/refresh-lifecycle-regression.py --live
+      - name: Installer rejects failed systemd cleanup
+        run: sudo python3 tests/install-preflight-regression.py --live

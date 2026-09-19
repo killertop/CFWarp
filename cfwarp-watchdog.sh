@@ -6,7 +6,7 @@ COMMON_FILE="${SCRIPT_DIR}/lib/cfwarp-common.sh"
 [ -r "$COMMON_FILE" ] || { echo "==> [ERROR] 找不到共享库: $COMMON_FILE" >&2; exit 1; }
 # shellcheck disable=SC1090
 . "$COMMON_FILE"
-cfwarp_load_env "$SCRIPT_DIR" || exit 1
+cfwarp_load_env "$SCRIPT_DIR" required || exit 1
 
 CFWARP_SERVICE_NAME=${CFWARP_SERVICE_NAME:-cfwarp.service}
 CFWARP_WATCHDOG_RETRIES=${CFWARP_WATCHDOG_RETRIES:-3}
@@ -115,14 +115,34 @@ if restart_is_in_cooldown; then
     exit 0
 fi
 
+# Health checks can outlive a manual stop. Recheck immediately before recovery,
+# and let systemd conditionally restart without replacing a queued stop job.
+if ! systemctl is-active --quiet "$CFWARP_SERVICE_NAME"; then
+    reset_failure_count
+    exit 0
+fi
 record_restart_time
 reset_failure_count
 echo "==> [CFwarp] 健康检查连续失败，正在重启 ${CFWARP_SERVICE_NAME}。" >&2
 cat "$TMP_HEALTH" >&2
-if ! systemctl restart "$CFWARP_SERVICE_NAME"; then
-    echo "==> [CFwarp] 重启失败，将等待冷却期后再试。" >&2
-    exit 1
+CFWARP_RESTART_OK=0
+if systemctl try-restart --job-mode=fail "$CFWARP_SERVICE_NAME"; then
+    CFWARP_RESTART_OK=1
 fi
+CFWARP_RESTART_STATE=$(systemctl show --property=ActiveState --value "$CFWARP_SERVICE_NAME") || CFWARP_RESTART_STATE=unknown
+case "$CFWARP_RESTART_STATE" in
+    inactive|deactivating) exit 0 ;;
+    active)
+        if [ "$CFWARP_RESTART_OK" != 1 ]; then
+            echo "==> [CFwarp] 重启失败，将等待冷却期后再试。" >&2
+            exit 1
+        fi
+        ;;
+    *)
+        echo "==> [CFwarp] 重启失败或状态无法确认 (${CFWARP_RESTART_STATE})，将等待冷却期后再试。" >&2
+        exit 1
+        ;;
+esac
 if ! CFWARP_HEALTH_RETRIES="$CFWARP_WATCHDOG_RETRIES" \
      CFWARP_HEALTH_RETRY_DELAY_SECONDS="$CFWARP_WATCHDOG_RETRY_DELAY_SECONDS" \
      "$SCRIPT_DIR/cfwarp-healthcheck.sh" --wait --format env > "$TMP_HEALTH" 2>&1; then

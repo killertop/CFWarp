@@ -175,6 +175,7 @@ install_deps() {
 
 CFWARP_BUILD_TMP=
 CFWARP_MICROSOCKS_STAGED=
+CFWARP_WG_QUICK_STAGED=
 cleanup_install_temporary_files() {
     CFWARP_INSTALL_EXIT_STATUS=$?
     trap - EXIT HUP INT TERM
@@ -184,6 +185,10 @@ cleanup_install_temporary_files() {
     if [ -n "$CFWARP_MICROSOCKS_STAGED" ]; then
         rm -f "$CFWARP_MICROSOCKS_STAGED" || CFWARP_INSTALL_EXIT_STATUS=1
     fi
+    if [ -n "$CFWARP_WG_QUICK_STAGED" ]; then
+        rm -f "$CFWARP_WG_QUICK_STAGED" || CFWARP_INSTALL_EXIT_STATUS=1
+    fi
+    release_install_runtime_locks || CFWARP_INSTALL_EXIT_STATUS=1
     exit "$CFWARP_INSTALL_EXIT_STATUS"
 }
 
@@ -221,7 +226,7 @@ publish_microsocks() {
     CFWARP_MICROSOCKS_STAGED=
 }
 
-install_private_wg_quick() {
+prepare_private_wg_quick() {
     if [ -z "${WG_QUICK_SRC:-}" ]; then
         # Prefer the package copy, not a previously patched private binary on PATH.
         if [ -x /usr/bin/wg-quick ]; then
@@ -235,17 +240,21 @@ install_private_wg_quick() {
         exit 1
     fi
     install -d "$BIN_DIR"
-    if [ "$WG_QUICK_SRC" != "${BIN_DIR}/wg-quick" ]; then
-        install -m 0755 "$WG_QUICK_SRC" "${BIN_DIR}/wg-quick"
-    else
-        chmod 0755 "${BIN_DIR}/wg-quick"
-    fi
+    CFWARP_WG_QUICK_STAGED=$(mktemp "${BIN_DIR}/.wg-quick.new.XXXXXX")
+    install -m 0755 "$WG_QUICK_SRC" "$CFWARP_WG_QUICK_STAGED"
     # src_valid_mark is network-namespaced and needed with strict rp_filter.
     # Preserve the complete distribution script, including its routing setup.
-    if ! command -v bash >/dev/null 2>&1 || ! bash -n "${BIN_DIR}/wg-quick"; then
+    if ! command -v bash >/dev/null 2>&1 || ! bash -n "$CFWARP_WG_QUICK_STAGED"; then
         echo "==> [ERROR] 私有 wg-quick 语法校验失败。" >&2
         exit 1
     fi
+}
+
+install_private_wg_quick() {
+    # Publish the exact bytes checked before stopping the old service.
+    [ -n "$CFWARP_WG_QUICK_STAGED" ] || return 1
+    mv -f "$CFWARP_WG_QUICK_STAGED" "${BIN_DIR}/wg-quick"
+    CFWARP_WG_QUICK_STAGED=
 }
 
 ensure_env_file() {
@@ -333,7 +342,10 @@ cleanup_read_unit_state() {
     CFWARP_CLEAN_ACTIVE_STATE=$(systemctl show --property=ActiveState --value "$1") || return 1
     CFWARP_CLEAN_UNIT_RUNNING=1
     case "$CFWARP_CLEAN_ACTIVE_STATE" in
-        inactive|failed) CFWARP_CLEAN_UNIT_RUNNING=0 ;;
+        inactive) CFWARP_CLEAN_UNIT_RUNNING=0 ;;
+        failed)
+            echo "$1 处于 failed，无法证明旧资源已清理；请先用旧运行文件完成恢复并验证，拒绝修改安装。" >&2
+            return 1 ;;
         '') echo "无法读取 $1 的运行状态，拒绝修改安装。" >&2; return 1 ;;
     esac
 }
@@ -367,12 +379,22 @@ clean_generated() {
         systemctl stop cfwarp-watchdog.timer cfwarp-endpoint-refresh.timer >/dev/null 2>&1 || true
         for CFWARP_CLEAN_UNIT in cfwarp-watchdog.service cfwarp-endpoint-refresh.service; do
             cleanup_read_unit_state "$CFWARP_CLEAN_UNIT" || return 1
-            if [ "$CFWARP_CLEAN_UNIT_RUNNING" = 1 ]; then systemctl stop "$CFWARP_CLEAN_UNIT"; fi
+            if [ "$CFWARP_CLEAN_UNIT_RUNNING" = 1 ]; then
+                systemctl stop "$CFWARP_CLEAN_UNIT" || return 1
+                cleanup_read_unit_state "$CFWARP_CLEAN_UNIT" || return 1
+                [ "$CFWARP_CLEAN_UNIT_RUNNING" = 0 ] || return 1
+            fi
         done
         cleanup_read_unit_state cfwarp.service || return 1
         if [ "$CFWARP_CLEAN_UNIT_RUNNING" = 1 ]; then
-            systemctl stop cfwarp.service
+            systemctl stop cfwarp.service || return 1
+            cleanup_read_unit_state cfwarp.service || return 1
+            [ "$CFWARP_CLEAN_UNIT_RUNNING" = 0 ] || return 1
         fi
+    fi
+    # Includes --force: it never overrides a live CLI controller.
+    acquire_install_runtime_locks || return 1
+    if [ "$CFWARP_CLEAN_SYSTEMD" = 1 ]; then
         systemctl disable --now cfwarp-watchdog.timer cfwarp-endpoint-refresh.timer >/dev/null 2>&1 || true
         systemctl disable cfwarp.service cfwarp-watchdog.service cfwarp-endpoint-refresh.service >/dev/null 2>&1 || true
     fi
@@ -381,12 +403,14 @@ clean_generated() {
     rm -f "${BIN_DIR}/cfwarp" "${INSTALL_PREFIX}/cfwarp"
     rm -f "${INSTALL_PREFIX}/cfwarp-exec" "${INSTALL_PREFIX}/entrypoint.sh" "${INSTALL_PREFIX}/cfwarp-start.sh" "${INSTALL_PREFIX}/cfwarp-stop.sh" "${INSTALL_PREFIX}/cfwarp-netns.sh" "${INSTALL_PREFIX}/cfwarp-refresh-endpoint.sh" "${INSTALL_PREFIX}/cfwarp-healthcheck.sh" "${INSTALL_PREFIX}/cfwarp-watchdog.sh" "${INSTALL_PREFIX}/cfwarp-doctor.sh"
     rm -f "${INSTALL_PREFIX}/lib/cfwarp-common.sh" "${INSTALL_PREFIX}/deploy/installation.env"
+    release_install_runtime_locks || return 1
     systemd_available && systemctl daemon-reload || true
     echo "已清理 CFwarp 生成物；未删除环境文件和 WARP 数据目录。"
 }
 
 reload_and_enable() {
     if ! systemd_available; then
+        release_install_runtime_locks || return 1
         echo "未检测到运行中的 systemd，已安装文件但未执行 daemon-reload/enable/start。"
         return 0
     fi
@@ -395,6 +419,7 @@ reload_and_enable() {
     fi
     systemctl daemon-reload
     [ "$ENABLE_SERVICE" = "1" ] && systemctl enable cfwarp.service
+    release_install_runtime_locks || return 1
     if [ "$ENABLE_REFRESH_TIMER" = "1" ]; then
         systemctl enable --now cfwarp-endpoint-refresh.timer
     fi
@@ -487,6 +512,149 @@ acquire_install_lock() {
     flock -n 9 || { echo 'Another CFwarp installation is running.' >&2; return 1; }
 }
 
+# Installer-only gates. Never import the installer's environment as old config.
+install_lock_value() (
+    CFWARP_I_VALUES=$(cfwarp_parse_env "$2") || exit 1
+    printf '%s\n' "$CFWARP_I_VALUES" |
+        awk -v key="$1" 'index($0,key "=")==1 {print substr($0,length(key)+2)}'
+)
+
+install_runtime_lock_targets() (
+    CFWARP_I_OLD_ENV=$ENV_FILE
+    CFWARP_I_MARKER="${INSTALL_PREFIX}/deploy/installation.env"
+    CFWARP_I_EXISTING=0
+    if [ -e "$CFWARP_I_MARKER" ] || [ -L "$CFWARP_I_MARKER" ]; then
+        CFWARP_I_EXISTING=1
+        CFWARP_I_OLD_ENV=$(install_lock_value CFWARP_ENV_FILE "$CFWARP_I_MARKER") || exit 1
+        [ -n "$CFWARP_I_OLD_ENV" ] || exit 1
+    elif [ -f "${INSTALL_PREFIX}/cfwarp-start.sh" ]; then
+        CFWARP_I_EXISTING=1
+        CFWARP_I_OLD_ENV=$(cfwarp_default_env_file "$INSTALL_PREFIX") || exit 1
+    fi
+    case "$CFWARP_I_OLD_ENV" in /*) ;; *) return 1 ;; esac
+    CFWARP_I_OLD_DATA="${INSTALL_PREFIX}/var"
+    CFWARP_I_OLD_REFRESH=/run/cfwarp-refresh
+    if [ -e "$CFWARP_I_OLD_ENV" ] || [ -L "$CFWARP_I_OLD_ENV" ]; then
+        CFWARP_I_EXISTING=1
+        CFWARP_I_VALUE=$(install_lock_value CFWARP_DATA_DIR "$CFWARP_I_OLD_ENV") || exit 1
+        CFWARP_I_OLD_DATA=${CFWARP_I_VALUE:-$CFWARP_I_OLD_DATA}
+        CFWARP_I_VALUE=$(install_lock_value CFWARP_ENDPOINT_REFRESH_STATE_ROOT "$CFWARP_I_OLD_ENV") || exit 1
+        CFWARP_I_OLD_REFRESH=${CFWARP_I_VALUE:-$CFWARP_I_OLD_REFRESH}
+    elif [ "$CFWARP_I_EXISTING" = 1 ]; then
+        echo 'Cannot resolve old runtime configuration; refusing file changes.' >&2
+        exit 1
+    fi
+    CFWARP_I_NEW_DATA=$DATA_DIR
+    CFWARP_I_NEW_REFRESH=/run/cfwarp-refresh
+    if [ "$RUN_CLEAN_GENERATED" = 1 ]; then
+        CFWARP_I_NEW_DATA=$CFWARP_I_OLD_DATA
+        CFWARP_I_NEW_REFRESH=$CFWARP_I_OLD_REFRESH
+    else
+        CFWARP_I_NEW_ENV=$ENV_TEMPLATE
+        if [ -e "$ENV_FILE" ] || [ -L "$ENV_FILE" ]; then
+            CFWARP_I_NEW_ENV=$ENV_FILE
+            if [ "$DATA_DIR_SET" = 0 ]; then
+                CFWARP_I_VALUE=$(install_lock_value CFWARP_DATA_DIR "$ENV_FILE") || exit 1
+                CFWARP_I_NEW_DATA=${CFWARP_I_VALUE:-$DATA_DIR}
+            fi
+        fi
+        CFWARP_I_VALUE=$(install_lock_value CFWARP_ENDPOINT_REFRESH_STATE_ROOT "$CFWARP_I_NEW_ENV") || exit 1
+        CFWARP_I_NEW_REFRESH=${CFWARP_I_VALUE:-$CFWARP_I_NEW_REFRESH}
+    fi
+    if [ "$CFWARP_I_EXISTING" = 0 ]; then
+        CFWARP_I_OLD_DATA=$CFWARP_I_NEW_DATA
+        CFWARP_I_OLD_REFRESH=$CFWARP_I_NEW_REFRESH
+    fi
+    # Canonicalize aliases, including not-yet-created destination directories.
+    for CFWARP_I_PATH in "$CFWARP_I_OLD_REFRESH" "$CFWARP_I_NEW_REFRESH" \
+        "$CFWARP_I_OLD_DATA" "$CFWARP_I_NEW_DATA"; do
+        case "$CFWARP_I_PATH" in /*) ;; *) return 1 ;; esac
+        CFWARP_I_PATH=$(realpath -m -- "$CFWARP_I_PATH") || exit 1
+        [ "$CFWARP_I_PATH" != / ] || exit 1
+        printf '%s\n' "$CFWARP_I_PATH"
+    done
+)
+
+prepare_install_runtime_lock() {
+    install -d -m 0700 "$1" || return 1
+    CFWARP_INSTALL_GATE_FILE="$1/$2"
+    if [ -L "$CFWARP_INSTALL_GATE_FILE" ] || \
+        { [ -e "$CFWARP_INSTALL_GATE_FILE" ] && [ ! -f "$CFWARP_INSTALL_GATE_FILE" ]; }; then
+        echo 'Runtime lock must be a regular, non-symlink file.' >&2
+        return 1
+    fi
+}
+
+take_install_runtime_lock() {
+    flock -n "$1" || {
+        echo 'Runtime/CLI refresh is busy; refusing file changes (also with --force).' >&2
+        return 1
+    }
+    CFWARP_INSTALL_GATE_FDS="$1 ${CFWARP_INSTALL_GATE_FDS:-}"
+}
+
+install_runtime_same_file() {
+    [ -e "$1" ] && [ -e "$2" ] || return 1
+    CFWARP_INSTALL_FILE_ID=$(stat -c '%d:%i' "$1") || return 1
+    CFWARP_INSTALL_OTHER_FILE_ID=$(stat -c '%d:%i' "$2") || return 1
+    [ "$CFWARP_INSTALL_FILE_ID" = "$CFWARP_INSTALL_OTHER_FILE_ID" ]
+}
+
+release_install_runtime_locks() {
+    [ "${CFWARP_INSTALL_GATES_OPEN:-0}" = 1 ] || return 0
+    for CFWARP_INSTALL_GATE_FD in ${CFWARP_INSTALL_GATE_FDS:-}; do
+        flock -u "$CFWARP_INSTALL_GATE_FD" || return 1
+    done
+    exec 3>&- 6>&- 4>&- 5>&-
+    CFWARP_INSTALL_GATE_FDS=
+    CFWARP_INSTALL_GATES_OPEN=0
+}
+
+acquire_install_runtime_locks() {
+    CFWARP_INSTALL_TARGETS=$(install_runtime_lock_targets) || return 1
+    CFWARP_INSTALL_OLD_REFRESH=$(printf '%s\n' "$CFWARP_INSTALL_TARGETS" | sed -n '1p')
+    CFWARP_INSTALL_NEW_REFRESH=$(printf '%s\n' "$CFWARP_INSTALL_TARGETS" | sed -n '2p')
+    CFWARP_INSTALL_OLD_DATA=$(printf '%s\n' "$CFWARP_INSTALL_TARGETS" | sed -n '3p')
+    CFWARP_INSTALL_NEW_DATA=$(printf '%s\n' "$CFWARP_INSTALL_TARGETS" | sed -n '4p')
+    CFWARP_INSTALL_GATES_OPEN=1
+    CFWARP_INSTALL_GATE_FDS=
+    CFWARP_INSTALL_GATE_UMASK=$(umask)
+    umask 077
+    # fd 9 is the existing installation lock: never reopen it here.
+    # Take ALL refresh locks before ANY lifecycle lock.
+    prepare_install_runtime_lock "$CFWARP_INSTALL_OLD_REFRESH" refresh.lock || return 1
+    exec 5>>"$CFWARP_INSTALL_GATE_FILE"
+    take_install_runtime_lock 5 || return 1
+    prepare_install_runtime_lock "$CFWARP_INSTALL_NEW_REFRESH" refresh.lock || return 1
+    if [ "$CFWARP_INSTALL_NEW_REFRESH" != "$CFWARP_INSTALL_OLD_REFRESH" ] && \
+        ! install_runtime_same_file "$CFWARP_INSTALL_GATE_FILE" "$CFWARP_INSTALL_OLD_REFRESH/refresh.lock"; then
+        exec 4>>"$CFWARP_INSTALL_GATE_FILE"
+        take_install_runtime_lock 4 || return 1
+    fi
+    prepare_install_runtime_lock "$CFWARP_INSTALL_OLD_DATA" .service-probe.lock || return 1
+    cfwarp_lifecycle_lock "$CFWARP_INSTALL_OLD_DATA" || return 1
+    CFWARP_INSTALL_GATE_FDS="6 $CFWARP_INSTALL_GATE_FDS"
+    cfwarp_refresh_is_clear || return 1
+    prepare_install_runtime_lock "$CFWARP_INSTALL_NEW_DATA" .service-probe.lock || return 1
+    if [ "$CFWARP_INSTALL_NEW_DATA" != "$CFWARP_INSTALL_OLD_DATA" ] && \
+        ! install_runtime_same_file "$CFWARP_INSTALL_GATE_FILE" "$CFWARP_INSTALL_OLD_DATA/.service-probe.lock"; then
+        exec 3>>"$CFWARP_INSTALL_GATE_FILE"
+        take_install_runtime_lock 3 || return 1
+    fi
+    if [ -e "$CFWARP_INSTALL_NEW_DATA/.refresh-pending" ] || \
+        [ -L "$CFWARP_INSTALL_NEW_DATA/.refresh-pending" ]; then
+        echo 'Destination has pending refresh recovery; refusing file changes.' >&2
+        return 1
+    fi
+    # Refuse a configuration-path change observed while acquiring the gates.
+    CFWARP_INSTALL_TARGETS_NOW=$(install_runtime_lock_targets) || return 1
+    [ "$CFWARP_INSTALL_TARGETS_NOW" = "$CFWARP_INSTALL_TARGETS" ] || {
+        echo 'Runtime lock paths changed; retry with stable configuration.' >&2
+        return 1
+    }
+    umask "$CFWARP_INSTALL_GATE_UMASK"
+}
+
 print_summary() {
     cat <<EOF
 CFwarp 安装文件已准备完成:
@@ -533,7 +701,9 @@ done
 trap cleanup_install_temporary_files EXIT
 trap 'exit 143' HUP INT TERM
 build_microsocks
+prepare_private_wg_quick
 stop_for_upgrade
+acquire_install_runtime_locks
 publish_microsocks
 install_private_wg_quick
 install_runtime_files

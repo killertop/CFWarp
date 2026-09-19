@@ -10,7 +10,7 @@ if [ ! -r "$COMMON_FILE" ]; then
 fi
 # shellcheck disable=SC1090
 . "$COMMON_FILE"
-cfwarp_load_env "$SCRIPT_DIR" || exit 1
+cfwarp_load_env "$SCRIPT_DIR" required || exit 1
 
 WG_INTERFACE=${WG_INTERFACE:-wg0}
 CFWARP_DATA_DIR=${CFWARP_DATA_DIR:-${SCRIPT_DIR}/var}

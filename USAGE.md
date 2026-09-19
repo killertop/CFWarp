@@ -40,6 +40,8 @@ NETNS_DNS_SERVERS="1.1.1.1 1.0.0.1"
 
 显式 CLI 选项优先于对应配置；已导出的进程环境变量优先于文件值，其次依次为配置文件、安装记录中的默认路径和脚本默认值。`CFWARP_ENV_FILE` 可指定配置位置；未指定时通过安装记录定位，源码运行才使用默认配置查找。助手通过共享加载逻辑传递已解析的配置，子进程不再重新加载旧值覆盖调用者。
 
+启动、刷新和进入 namespace 时，显式指定或安装记录指向的环境文件必须存在且可读；文件丢失或链接目标不存在时会报错，不会自动回退到空认证或新账户。已有运行进程继续使用其已加载的配置快照。
+
 临时检查其他配置：
 
 ```bash
@@ -178,7 +180,15 @@ sudo journalctl -u cfwarp-endpoint-refresh.service -n 100 --no-pager
 
 ### 8. 升级与清理
 
-升级前备份私有配置和账户数据，在新版源码目录运行安装器：
+升级前备份私有配置和账户数据，在新版源码目录运行安装器。安装器在停服前校验 `wg-quick`；服务处于 `failed` 或停止后的清理失败时，保留旧运行文件并拒绝继续。先用旧版本完成资源清理并验证，再处理失败状态并重试；`--force` 不能跳过清理失败。
+
+安装器在替换或清理运行文件前，取得旧、新配置对应的刷新锁和数据目录生命周期锁。终端直接运行的 `cfwarp refresh` 也会阻止文件变更，`--force` 不会绕过互斥或未完成的恢复标记。取锁失败时，前面已停止的服务可能仍保持停止；处理占用后重新运行安装器。
+
+锁保护文件发布阶段，不提供多文件发布回滚，也不能约束管理员并发改配置、systemd drop-in 或替换锁文件。发布完成后会先释放运行锁再恢复服务；如果此时其他进程抢先占锁，启动可能失败，需要消除占用后重试。
+
+namespace 状态格式已升级为 v3，增加数据目录归属检查。v2 状态必须由旧运行文件清理；使用安装器完成升级，不要直接覆盖正在运行的安装目录。
+
+
 
 ```bash
 sudo cp -a /etc/cfwarp /root/cfwarp-config-backup
@@ -236,6 +246,8 @@ NETNS_DNS_SERVERS="1.1.1.1 1.0.0.1"
 ```
 
 Explicit CLI options take precedence over their corresponding settings. Exported process environment variables override file values; configuration files, installation-record path defaults, and script defaults follow in that order. `CFWARP_ENV_FILE` can select a configuration path. Otherwise, installed helpers use the installation record; source-tree execution falls back to default configuration discovery. Shared loading passes resolved settings to child processes without reloading stale values over the caller's choices.
+
+Startup, refresh, and namespace entry require explicitly selected or installed environment files to exist and be readable. Missing files or dangling links cause an error rather than fallback to empty authentication or a new account. Existing processes retain their loaded configuration snapshot.
 
 Check another configuration temporarily:
 
@@ -375,7 +387,14 @@ sudo journalctl -u cfwarp-endpoint-refresh.service -n 100 --no-pager
 
 ### 8. Upgrade and cleanup
 
-Back up private configuration and account data, then run the installer from the new source checkout:
+Back up private configuration and account data, then run the installer from the new source checkout. The installer validates `wg-quick` before stopping services. A failed unit or unsuccessful stop cleanup blocks further changes and preserves the old runtime. Complete and verify resource cleanup with the old version before clearing the failure state and retrying; `--force` does not bypass cleanup failure.
+
+Before replacing or cleaning runtime files, the installer acquires refresh and lifecycle locks for the old and new configuration paths. Direct CLI `cfwarp refresh` also blocks changes; `--force` cannot bypass contention or pending recovery. Lock refusal can leave previously stopped services stopped; resolve contention and rerun the installer.
+
+The gates protect publication, without multi-file rollback or protection against concurrent administrator changes to configuration, systemd drop-ins, or lock files. Runtime gates are released before service restoration. Another process winning a gate at that point can prevent startup; resolve contention before retrying.
+
+Namespace state format v3 adds data-directory ownership checks. The previous runtime must clean v2 state. Upgrade through the installer rather than overwriting a running installation directory.
+
 
 ```bash
 sudo cp -a /etc/cfwarp /root/cfwarp-config-backup

@@ -14,13 +14,13 @@ fi
 # startup using settings read before the lock was acquired.
 if [ "${CFWARP_TEST_MODE:-0}" != 1 ]; then
     CFWARP_START_DATA_DIR=$(
-        cfwarp_load_env "$SCRIPT_DIR" || exit 1
+        cfwarp_load_env "$SCRIPT_DIR" required || exit 1
         printf '%s\n' "${CFWARP_DATA_DIR:-${SCRIPT_DIR}/var}"
     )
     cfwarp_lifecycle_lock "$CFWARP_START_DATA_DIR" || exit 1
     cfwarp_refresh_is_clear || exit 1
 fi
-cfwarp_load_env "$SCRIPT_DIR"
+cfwarp_load_env "$SCRIPT_DIR" required
 
 CFWARP_MODE=${CFWARP_MODE:-netns-proxy}
 WG_INTERFACE=${WG_INTERFACE:-wg0}
