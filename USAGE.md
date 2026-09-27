@@ -186,6 +186,8 @@ sudo journalctl -u cfwarp-endpoint-refresh.service -n 100 --no-pager
 
 锁保护文件发布阶段，不提供多文件发布回滚，也不能约束管理员并发改配置、systemd drop-in 或替换锁文件。发布完成后会先释放运行锁再恢复服务；如果此时其他进程抢先占锁，启动可能失败，需要消除占用后重试。
 
+刷新和 watchdog 在 Shell 清理完成后返回的取消退出码 143 视为正常停止；清理、恢复失败仍为 failed。旧版已安装的辅助 unit 可能在正常停止后保留 failed：先查看日志、恢复标记，并用旧运行文件完成残留清理，再清除失败状态并重试升级，不能仅为绕过安装器而清除失败状态。
+
 namespace 状态格式已升级为 v3，增加数据目录归属检查。v2 状态必须由旧运行文件清理；使用安装器完成升级，不要直接覆盖正在运行的安装目录。
 
 
@@ -392,6 +394,8 @@ Back up private configuration and account data, then run the installer from the 
 Before replacing or cleaning runtime files, the installer acquires refresh and lifecycle locks for the old and new configuration paths. Direct CLI `cfwarp refresh` also blocks changes; `--force` cannot bypass contention or pending recovery. Lock refusal can leave previously stopped services stopped; resolve contention and rerun the installer.
 
 The gates protect publication, without multi-file rollback or protection against concurrent administrator changes to configuration, systemd drop-ins, or lock files. Runtime gates are released before service restoration. Another process winning a gate at that point can prevent startup; resolve contention before retrying.
+
+Refresh and watchdog cancellation exit code 143 is considered clean only after their shell cleanup returns. Cleanup/recovery errors still fail the unit. Older installed helper templates may retain a failed state after a normal stop; inspect their logs and recovery markers and finish any remaining cleanup with the old runtime before resetting the failed state and retrying the upgrade. Do not clear failure merely to bypass the installer.
 
 Namespace state format v3 adds data-directory ownership checks. The previous runtime must clean v2 state. Upgrade through the installer rather than overwriting a running installation directory.
 

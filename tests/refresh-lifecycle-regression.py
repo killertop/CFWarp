@@ -29,7 +29,7 @@ class Lifecycle(unittest.TestCase):
         self.data = self.base / "data"
         for path in (self.project / "lib", self.bin, self.data):
             path.mkdir(parents=True)
-        for script in ("cfwarp-start.sh", "cfwarp-stop.sh", "cfwarp-refresh-endpoint.sh", "lib/cfwarp-common.sh"):
+        for script in ("cfwarp-start.sh", "cfwarp-stop.sh", "cfwarp-watchdog.sh", "cfwarp-refresh-endpoint.sh", "lib/cfwarp-common.sh"):
             shutil.copy2(ROOT / script, self.project / script)
         self.env_file = self.base / "cfwarp.env"
         self.env_file.write_text(f'CFWARP_DATA_DIR="{self.data}"\nENDPOINT_IP=192.0.2.10:2408\n')
@@ -71,6 +71,10 @@ case "$1" in
         if [ "$kind" = probe ]; then rm -f "$CASE_ROOT/hold-post"; fi
         ;;
     down)
+        if [ "$kind" = probe ] && [ -e "$CASE_ROOT/hold-cleanup" ]; then
+            touch "$CASE_ROOT/cleanup-entered"
+            while [ -e "$CASE_ROOT/hold-cleanup" ]; do sleep 0.1; done
+        fi
         if [ "$kind" = main ] && [ -e "$CASE_ROOT/fail-main-cleanup" ]; then exit 1; fi
         if [ "$kind" = probe ] && [ -e "$CASE_ROOT/fail-cleanup" ]; then exit 1; fi
         rm -f "$CASE_ROOT/$kind-kernel"
@@ -178,6 +182,22 @@ esac
         self.wait_for(lambda: (self.base / "main-active").exists())
         self.stop(main)
 
+    def test_repeated_stop_cannot_interrupt_failed_cleanup(self):
+        (self.base / "hold-probe").touch()
+        (self.base / "hold-cleanup").touch()
+        (self.base / "fail-cleanup").touch()
+        refresh = self.launch("cfwarp-refresh-endpoint.sh")
+        self.wait_for(lambda: (self.base / "probe-active").exists())
+        refresh.send_signal(signal.SIGTERM)
+        self.wait_for(lambda: (self.base / "cleanup-entered").exists())
+        os.killpg(refresh.pid, signal.SIGTERM)
+        (self.base / "hold-cleanup").unlink()
+        self.assertEqual(refresh.wait(timeout=15), 1)
+        self.assertTrue((self.data / ".refresh-pending").exists())
+        self.assertTrue((self.base / "probe-kernel").exists())
+        logs = list((self.data / "recovery").glob("*/recovery.log"))
+        self.assertTrue(any("probe network cleanup" in log.read_text() for log in logs))
+
     def test_failed_main_cleanup_blocks_probe_identity_reuse(self):
         (self.base / "main-kernel").touch()
         (self.base / "fail-main-cleanup").touch()
@@ -186,6 +206,67 @@ esac
         self.assertFalse((self.base / "probe-kernel").exists())
         self.assertTrue((self.base / "main-kernel").exists())
         self.assertTrue((self.data / ".refresh-pending").exists())
+
+    def launch_helper_unit(self, helper):
+        self.assertEqual(os.geteuid(), 0, "--live needs root in a disposable VM")
+        self.unit = f"cfwarp-helper-{os.getpid()}.service"
+        template = (ROOT / f"deploy/systemd/cfwarp-{helper}.service.in").read_text()
+        template = template.replace("@INSTALL_PREFIX@", str(self.project)).replace("@ENV_FILE@", str(self.env_file))
+        # Render the shipped template, retaining its success/cleanup semantics.
+        additions = "\n[Service]\nTimeoutStopSec=20\n"
+        for key in ("CASE_ROOT", "PATH", "CFWARP_ENDPOINT_REFRESH_STATE_ROOT",
+                    "CFWARP_ENDPOINT_REFRESH_ACTIVE_MODE", "ENDPOINT_CANDIDATES"):
+            additions += f'Environment="{key}={self.env[key]}"\n'
+        unit_path = self.base / self.unit
+        unit_path.write_text(template + additions)
+        subprocess.run(["systemctl", "link", str(unit_path)], check=True, capture_output=True)
+        subprocess.run(["systemctl", "daemon-reload"], check=True)
+        subprocess.run(["systemctl", "start", "--no-block", self.unit], check=True)
+
+    def helper_state(self):
+        return subprocess.check_output(["systemctl", "show", "-p", "ActiveState", "--value", self.unit], text=True).strip()
+
+    @unittest.skipUnless(LIVE, "--live enables real helper cancellation")
+    def test_rendered_refresh_cancel_cleans_and_is_inactive(self):
+        (self.base / "hold-probe").touch()
+        self.launch_helper_unit("endpoint-refresh")
+        self.wait_for(lambda: (self.base / "probe-active").exists())
+        subprocess.run(["systemctl", "stop", self.unit], check=True)
+        self.assertEqual(self.helper_state(), "inactive")
+        self.assertFalse((self.base / "probe-kernel").exists())
+        self.assertFalse((self.data / ".refresh-pending").exists())
+
+    @unittest.skipUnless(LIVE, "--live enables real helper cancellation")
+    def test_rendered_refresh_cancel_cleanup_failure_stays_failed(self):
+        (self.base / "hold-probe").touch()
+        (self.base / "fail-cleanup").touch()
+        self.launch_helper_unit("endpoint-refresh")
+        self.wait_for(lambda: (self.base / "probe-active").exists())
+        subprocess.run(["systemctl", "stop", self.unit], check=True)
+        self.assertEqual(self.helper_state(), "failed")
+        self.assertTrue((self.base / "probe-kernel").exists())
+        self.assertTrue((self.data / ".refresh-pending").exists())
+
+    @unittest.skipUnless(LIVE, "--live enables real helper cancellation")
+    def test_rendered_watchdog_cancel_is_inactive(self):
+        self.write(self.bin / "systemctl", '#!/bin/sh\ncase "$1" in is-active) exit 0 ;; *) exit 1 ;; esac\n')
+        self.write(self.project / "cfwarp-healthcheck.sh", '#!/bin/sh\ntouch "$CASE_ROOT/health-active"\nexec sleep infinity\n')
+        self.launch_helper_unit("watchdog")
+        self.wait_for(lambda: (self.base / "health-active").exists())
+        subprocess.run(["systemctl", "stop", self.unit], check=True)
+        self.assertEqual(self.helper_state(), "inactive")
+
+    @unittest.skipUnless(LIVE, "--live enables real helper failure")
+    def test_rendered_watchdog_health_failure_stays_failed(self):
+        self.write(self.bin / "systemctl", '#!/bin/sh\ncase "$1" in is-active) exit 0 ;; *) exit 1 ;; esac\n')
+        self.write(self.project / "cfwarp-healthcheck.sh", '#!/bin/sh\nexit 1\n')
+        (self.base / "watchdog-count").write_text("1\n")
+        with self.env_file.open("a") as config:
+            config.write(f"CFWARP_WATCHDOG_STATE_FILE={self.base}/watchdog-count\n"
+                         f"CFWARP_WATCHDOG_RESTART_STATE_FILE={self.base}/watchdog-cooldown\n")
+        self.launch_helper_unit("watchdog")
+        self.wait_for(lambda: self.helper_state() == "failed")
+        self.assertTrue((self.base / "watchdog-cooldown").exists())
 
     @unittest.skipUnless(LIVE, "--live enables real systemd transitions")
     def test_systemd_activating_stop_restore_and_failed_cleanup(self):

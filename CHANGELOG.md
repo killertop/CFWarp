@@ -1,5 +1,20 @@
 # 更新记录 / Changelog
 
+## 2026-09-28
+
+### systemd 取消与 CI 修复 / systemd cancellation and CI fixes
+
+- 刷新和 watchdog 的 oneshot unit 接受清理完成后的取消退出码 143；清理、回滚或恢复失败仍进入 failed，安装器继续拒绝不安全升级。
+- 刷新停止先通知控制器，由它结束探测并完成回滚；清理期间忽略重复停止信号，超时仍由 systemd 强制结束。
+- 修正安装集成测试的正常 SIGTERM 退出定义，要求升级结束后各 unit 为 inactive。
+- 安装测试先检查全部服务和定时器，失败时仅清理本次创建的 unit 链接并保留诊断目录，避免残留损坏的测试安装。
+- 新增使用正式 unit 模板的真实 systemd 取消/失败回归。
+- Refresh and watchdog oneshot units accept cancellation exit code 143 after cleanup. Cleanup, rollback, and recovery failures remain failed and continue blocking unsafe upgrades.
+- Refresh stops signal the controller first so it can terminate probes and finish rollback; cleanup ignores repeated stop signals and remains bounded by systemd.
+- Installation fixtures declare clean SIGTERM termination and require inactive units after upgrade shutdown.
+- Installation tests protect all pre-existing services/timers, remove only their own unit links, and retain diagnostics on failure.
+- Added real systemd cancellation/failure regressions using the shipped unit templates.
+
 ## 2026-09-19
 
 ### 运行安全与升级保护 / Runtime and upgrade safeguards

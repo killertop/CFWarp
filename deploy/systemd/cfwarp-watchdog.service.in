@@ -4,6 +4,8 @@ After=cfwarp.service
 
 [Service]
 Type=oneshot
+# Shell handlers return 143 only after cancellation cleanup; failures return 1.
+SuccessExitStatus=143
 Environment=CFWARP_ENV_FILE=@ENV_FILE@
 WorkingDirectory=@INSTALL_PREFIX@
 ExecStart=/bin/sh @INSTALL_PREFIX@/cfwarp-watchdog.sh

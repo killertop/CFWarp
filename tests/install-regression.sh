@@ -6,17 +6,50 @@ if [ "${1:-}" != --live ]; then
     exit 0
 fi
 [ "$(uname -s)" = Linux ] && [ "$(id -u)" -eq 0 ] || exit 1
-if systemctl cat cfwarp.service >/dev/null 2>&1; then
-    echo 'Refusing installation test on a host with an existing cfwarp.service.' >&2
-    exit 1
-fi
-# A removed test unit may still have a failed tombstone in the manager.
-systemctl reset-failed cfwarp.service >/dev/null 2>&1 || true
+TEST_UNITS='cfwarp.service cfwarp-watchdog.service cfwarp-endpoint-refresh.service cfwarp-watchdog.timer cfwarp-endpoint-refresh.timer'
+for unit in $TEST_UNITS; do
+    if systemctl cat "$unit" >/dev/null 2>&1; then
+        echo "Refusing installation test on a host with an existing $unit." >&2
+        exit 1
+    fi
+done
+# Removed test units can retain failed tombstones in the manager.
+# shellcheck disable=SC2086
+systemctl reset-failed $TEST_UNITS >/dev/null 2>&1 || true
 ROOT_DIR=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
 TMP_DIR=$(mktemp -d /tmp/cfwarp-install-test.XXXXXX)
 cleanup() {
-    if [ -e "$TMP_DIR/runtime/lib/cfwarp-common.sh" ]; then run_install --clean-generated --force >/dev/null 2>&1 || true; fi
-    rm -rf "$TMP_DIR"
+    result=$?
+    trap - EXIT HUP INT TERM
+    # Do not depend on the installer under test to remove failed fixtures.
+    # Only touch unit links owned by this temporary installation.
+    owned_units=
+    for unit in $TEST_UNITS; do
+        if [ "$(readlink "/etc/systemd/system/$unit" 2>/dev/null)" = "$TMP_DIR/systemd/$unit" ]; then
+            owned_units="$owned_units $unit"
+        fi
+    done
+    for unit in $owned_units; do
+        case "$unit" in *.timer) systemctl stop "$unit" >/dev/null 2>&1 || true ;; esac
+    done
+    # A refresh stop hook may restore main, so stop it before stopping main.
+    for unit in cfwarp-watchdog.service cfwarp-endpoint-refresh.service cfwarp.service; do
+        case " $owned_units " in *" $unit "*) systemctl stop "$unit" >/dev/null 2>&1 || true ;; esac
+    done
+    for unit in $owned_units; do
+        systemctl disable "$unit" >/dev/null 2>&1 || true
+        if [ "$(readlink "/etc/systemd/system/$unit" 2>/dev/null)" = "$TMP_DIR/systemd/$unit" ]; then
+            rm -f "/etc/systemd/system/$unit"
+        fi
+    done
+    systemctl daemon-reload
+    for unit in $owned_units; do systemctl reset-failed "$unit" >/dev/null 2>&1 || true; done
+    if [ "$result" = 0 ]; then
+        rm -rf "$TMP_DIR"
+    else
+        echo "Installation test failed; fixture logs retained in $TMP_DIR" >&2
+    fi
+    exit "$result"
 }
 trap cleanup EXIT
 trap 'exit 143' HUP INT TERM
@@ -56,6 +89,8 @@ Description=CFwarp installation refusal test fixture
 [Service]
 Type=$unit_type
 ExecStart=/bin/sleep infinity
+# The fixture has no shell handler; SIGTERM is a clean cancellation.
+SuccessExitStatus=SIGTERM
 TimeoutStartSec=0
 TimeoutStopSec=5
 [Install]
@@ -134,6 +169,8 @@ Description=CFwarp upgrade main fixture
 [Service]
 Type=simple
 ExecStart=/bin/sleep infinity
+# The fixture has no shell handler; SIGTERM is a clean cancellation.
+SuccessExitStatus=SIGTERM
 ExecStopPost=/bin/sh $TMP_DIR/main-stopped.sh
 TimeoutStopSec=10
 EOF_MAIN
@@ -143,6 +180,8 @@ Description=CFwarp upgrade cancelled refresh fixture
 [Service]
 Type=oneshot
 ExecStart=/bin/sleep infinity
+# The fixture has no shell handler; SIGTERM is a clean cancellation.
+SuccessExitStatus=SIGTERM
 ExecStopPost=/bin/sh $TMP_DIR/refresh-cancelled.sh
 TimeoutStartSec=0
 TimeoutStopSec=10
@@ -177,7 +216,7 @@ awk '
     stop_for_upgrade || exit 1
     test "$SERVICE_WAS_ACTIVE" = 1 || exit 1
     for unit in cfwarp.service cfwarp-watchdog.service cfwarp-endpoint-refresh.service cfwarp-watchdog.timer cfwarp-endpoint-refresh.timer; do
-        case "$(systemctl show --property=ActiveState --value "$unit")" in inactive|failed) ;; *) exit 1 ;; esac
+        test "$(systemctl show --property=ActiveState --value "$unit")" = inactive || exit 1
     done
     cmp "$TMP_DIR/upgrade-bin/microsocks" "$TMP_DIR/old-binary" || exit 1
     test "$(cat "$TMP_DIR/upgrade-events")" = "$(printf 'restore-main\nmain-stopped')" || exit 1

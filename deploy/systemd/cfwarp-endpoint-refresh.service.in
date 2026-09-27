@@ -5,6 +5,12 @@ After=network-online.target
 
 [Service]
 Type=oneshot
+# Shell handlers return 143 only after cancellation cleanup; failures return 1.
+SuccessExitStatus=143
+# The controller supervises its probe group and must finish rollback itself.
+# systemd still kills the entire cgroup if stop cleanup exceeds its timeout.
+KillMode=mixed
+TimeoutStopSec=180
 Environment=CFWARP_ENV_FILE=@ENV_FILE@
 WorkingDirectory=@INSTALL_PREFIX@
 ExecStart=/bin/sh @INSTALL_PREFIX@/cfwarp-refresh-endpoint.sh

@@ -228,7 +228,10 @@ start_and_verify_service() {
 
 cleanup() {
     CFWARP_EXIT_STATUS=$?
-    trap - EXIT HUP INT TERM
+    trap - EXIT
+    # Cancellation must finish recovery; a repeated stop must not kill the
+    # rollback commands or bypass the failure status/recovery journal.
+    trap '' HUP INT TERM
     stop_probe_processes
     if ! cleanup_probe_network >> "$RECOVERY_LOG" 2>&1; then
         CFWARP_CAN_RESTART=0
