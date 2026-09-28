@@ -18,7 +18,8 @@ fi
 
 usage() {
     cat <<'EOF'
-CFwarp: Linux WARP egress for selected applications / Linux 按应用 WARP 出站代理
+CFwarp: WARP egress for Linux VPS and AI apps / Linux VPS 与 AI 应用的 WARP 出口
+Per-app SOCKS5; host default route preserved by default / 按应用 SOCKS5，默认保留宿主机路由
 Usage / 用法: cfwarp <command> [arguments]
   start | stop | restart | status   Manage the systemd service / 管理服务
   logs [-f] [-n NUMBER]             View logs / 查看日志

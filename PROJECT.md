@@ -4,6 +4,12 @@
 
 CFWarp 为 Linux 服务器上的指定应用提供 Cloudflare WARP 出站。公开维护路径是 `systemd + network namespace + TCP SOCKS5`，默认不替换宿主机默认路由。
 
+### 项目价值
+
+为 VPS 和机房服务器上的 AI API 客户端、Agent、自动化与后端服务增加可管理的 WARP 出口。应用可以评估原生机房出口之外的访问路径，无需先迁移业务或改变全机默认路由；故障出口保护、健康检查和恢复流程使这条路径便于长期运维。
+
+它提供通用网络接入能力：可能改善与原出口 IP、路由有关的访问问题，但不改变原 IP 信誉、不提供住宅 IP，也不保证任何 AI 平台可访问。具体客户端代理接入与服务可用性须分别验证。
+
 ### 当前范围
 
 - Linux 内核 WireGuard、network namespace、veth、iptables 与 systemd。
@@ -27,6 +33,12 @@ CFWarp 为 Linux 服务器上的指定应用提供 Cloudflare WARP 出站。公�
 ## English
 
 CFWarp provides Cloudflare WARP egress for selected applications on Linux servers. The maintained deployment is `systemd + network namespace + TCP SOCKS5`, preserving the host default route by default.
+
+### Project value
+
+Provide manageable WARP egress for AI API clients, agents, automation, and backend services on VPS and datacenter hosts. Evaluate an alternative to native datacenter egress without first moving workloads or changing the host default route. Fail-closed protection, health checks, and recovery make that path easier to operate over time.
+
+This is general network connectivity: it may improve access issues related to the original IP or route, but does not change IP reputation, supply residential IPs, or guarantee access to any AI platform. Verify client proxy integration and destination-service availability separately.
 
 ### Current scope
 

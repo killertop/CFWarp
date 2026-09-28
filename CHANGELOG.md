@@ -2,6 +2,13 @@
 
 ## 2026-09-28
 
+### 项目介绍与应用场景 / Positioning and use cases
+
+- 统一 GitHub 简介与中英文介绍，补充机房/VPS 替代出口、AI API/Agent 接入、分流和运维优势；区分出口可靠性与 IP 信誉、目标服务可用性。
+- 增加 AI 客户端接入、真实请求与流式响应验证说明，并更新架构文档中的 namespace 状态版本描述。
+- Aligned GitHub and bilingual project copy around datacenter/VPS egress, AI API/agent integration, per-app routing, and operations; distinguish egress reliability from IP reputation and service availability.
+- Added AI client, real-request, and streaming validation guidance; corrected the documented namespace state version.
+
 ### systemd 取消与 CI 修复 / systemd cancellation and CI fixes
 
 - 刷新和 watchdog 的 oneshot unit 接受清理完成后的取消退出码 143；清理、回滚或恢复失败仍进入 failed，安装器继续拒绝不安全升级。

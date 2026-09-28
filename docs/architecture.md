@@ -1,8 +1,14 @@
 # 架构决定与验证范围 / Architecture decisions and validation scope
 
-日期 / Date: 2026-09-10
+更新 / Updated: 2026-09-28
 
 ## 中文
+
+### 从应用需求到出口设计
+
+机房服务器上的 AI 客户端与自动化任务可能需要不同于宿主机的出站路径。CFWarp 用独立 network namespace 承载 WARP，再通过 SOCKS5 或 `cfwarp-exec` 供选定应用使用。这样可以单独评估机房出口与 WARP 出口，同时保留其他宿主机业务的默认路由。
+
+项目的可靠性机制是故障时阻止直连、资源归属校验和可检查的恢复流程。它不修改原生 IP 的信誉，也不提供 AI 平台级可用性保证；WARP 网络健康和目标 API 请求成功是两个需要分别验证的层次。
 
 ### 架构与语言决定
 
@@ -47,7 +53,7 @@ Endpoint 刷新开始前把原配置放入数据目录下独立、受限权限�
 
 systemd unit 只传入 `CFWARP_ENV_FILE` 的路径，由所有入口共用的数据解析器加载内容；unit 不再通过 `EnvironmentFile` 额外解析同一文件，从而避免 CLI 与服务对引号、行尾注释和优先级产生不同理解。
 
-新版 namespace 状态使用 `VERSION=2`，记录 namespace inode、veth ifindex、DNS 文件 inode 和已取得的 forwarding 引用。host-global 另外记录接口 ifindex、公钥和完整配置路径，并通过接口操作锁协调启动与停止。这些运行状态是判断清理归属的依据，不能用修改版本号或删除状态文件的方式绕过校验。
+新版 namespace 状态使用 `VERSION=3`，记录规范化数据目录 `OWNER_DATA_DIR`、namespace inode、veth ifindex、DNS 文件 inode 和已取得的 forwarding 引用。host-global 另外记录接口 ifindex、公钥和完整配置路径，并通过接口操作锁协调启动与停止。这些运行状态是判断清理归属的依据，不能用修改版本号或删除状态文件的方式绕过校验。
 
 升级前应保留旧版本及私有配置备份。安装器先停止正在运行的定时任务和服务，让旧版本自己的清理代码执行，再替换运行文件并按原运行状态恢复服务。旧版状态若无法由新版安全识别，新版会拒绝按资源名称清理；应使用创建该状态的版本完成停服，并核查 namespace、接口、规则和 forwarding 的恢复情况。安装文件更新成功不代表旧资源已清理，已有旧状态也不会被无条件认领或迁移。
 
@@ -72,6 +78,12 @@ systemd unit 只传入 `CFWARP_ENV_FILE` 的路径，由所有入口共用的数
 mock 通过不能替代内核验证；内核验证不能替代实际 WARP 请求。单次 trace 耗时不能证明带宽、长期稳定性或其他服务器表现。本轮发布的实际验证回执应与提交版本一同记录，尚未执行或不可达的项目明确标为未验证。
 
 ## English
+
+### From application needs to egress design
+
+AI clients and automation on datacenter servers may need an outbound path different from the host’s. CFWarp runs WARP in a dedicated network namespace, exposing it to selected applications through SOCKS5 or `cfwarp-exec`. This lets operators evaluate native and WARP egress separately while preserving the default route for other host workloads.
+
+Reliability mechanisms include blocking direct fallback, verifying resource ownership, and observable recovery. They do not change native IP reputation or guarantee AI-platform availability; WARP network health and successful API requests require separate validation.
 
 ### Architecture and language decision
 
@@ -116,7 +128,7 @@ The main service, watchdog, endpoint refresh, and host-side `cfwarp-exec` must s
 
 Units pass only the `CFWARP_ENV_FILE` path. Every entry point uses the shared data parser; units no longer parse the same file through `EnvironmentFile`. This prevents CLI/service differences in quoting, trailing comments, and precedence.
 
-The new namespace state uses `VERSION=2`, recording the namespace inode, veth ifindex, DNS-file inode, and held forwarding reference. Host-global mode separately records the interface ifindex, public key, and full configuration path, coordinating startup and shutdown with an interface operation lock. These records establish cleanup ownership. Editing a version field or deleting a state file is not a valid way to bypass ownership checks.
+The namespace state uses `VERSION=3`, recording the canonical `OWNER_DATA_DIR`, namespace inode, veth ifindex, DNS-file inode, and held forwarding reference. Host-global mode separately records the interface ifindex, public key, and full configuration path, coordinating startup and shutdown with an interface operation lock. These records establish cleanup ownership. Editing a version field or deleting a state file is not a valid way to bypass ownership checks.
 
 Keep the previous version and private configuration backups before upgrading. The installer first stops active timers and services so the previous version's own cleanup code runs, then replaces runtime files and restores the prior running state. If the new version cannot safely interpret old state, it refuses cleanup based only on resource names. Use the version that created that state to stop the service, then verify namespaces, interfaces, rules, and forwarding restoration. Successfully replacing installation files does not establish that old resources were removed; old state is not automatically claimed or migrated.
 

@@ -4,6 +4,8 @@
 
 ## 中文
 
+本指南帮助你为 Linux VPS 和机房服务器上的指定应用接入 WARP，适用于 AI API 客户端、Agent 与自动化服务。先验证出口，再验证目标业务；默认模式保留其他宿主机应用的原有默认路由。
+
 ### 1. 安装和启动
 
 面向具备 systemd、内核 WireGuard、network namespace 和 iptables 支持的 Linux 服务器。安装、网络配置和进入 namespace 需要 root；通过 SOCKS5 使用出口的普通应用不需要 root。
@@ -79,6 +81,15 @@ sudo /opt/cfwarp/cfwarp-exec curl https://www.cloudflare.com/cdn-cgi/trace
 默认不会替换宿主机默认路由，但会创建 veth 和本项目的 NAT/转发规则，并在需要时启用 IPv4 forwarding。停止时按记录的资源归属清理；同名外部资源不应被当作可接管资源。
 
 namespace 的出口防火墙在建立连通性前生效。隧道接口或路由消失时，新请求会失败，不会经宿主机直接出站；健康守护随后可以尝试恢复服务。此保护依赖内核防火墙，不依赖健康检查的轮询间隔。
+
+#### AI 应用与机房出口验证
+
+1. **确认网络出口**：运行上面的 trace 请求与 `cfwarp health`，确认代理和 WARP 隧道工作。
+2. **确认客户端接入**：在 AI SDK、Agent 或后端服务中明确配置 SOCKS5。部分客户端忽略 `ALL_PROXY`，部分需要额外 SOCKS 支持；只有 HTTP 代理选项的客户端不能直接把此 SOCKS5 地址当作 HTTP 代理。
+3. **确认业务成功**：使用自己的账号、API 凭据和有权限的模型发送最小实际请求，检查预期结果；流式响应还需完整读到结束。401/403/429 应结合目标服务返回的错误内容排查认证、权限、地区、出口策略或额度，不能只凭状态码判断 WARP 是否可用。
+4. **比较实际效果**：在同一服务器对照直连与代理路径的请求成功率、延迟和流式完整性，再决定哪些应用使用 WARP；不预设代理一定更快。
+
+WARP 为这些应用提供替代出口，不改变原机房 IP 的信誉或服务商的账号、地区与使用规则。默认健康检查验证的是 SOCKS5/WARP，并不持续验证每个 AI 平台或模型；关键业务仍需自己的业务探测。仅在受控本机或网络内使用代理，凭据保存在私有配置中。
 
 ### 4. DNS 与认证
 
@@ -213,6 +224,8 @@ sudo ./install.sh --clean-generated
 
 ## English
 
+Use this guide to give selected Linux VPS and datacenter workloads a WARP path, including AI API clients, agents, and automation. Verify egress first, then the target workload; default mode preserves the existing default route for other host applications.
+
 ### 1. Install and start
 
 Use a Linux server with systemd, in-kernel WireGuard, network namespaces, and iptables. Installation, network setup, and namespace entry require root. Applications connecting to the SOCKS5 proxy do not need root.
@@ -288,6 +301,15 @@ This requires root and runs the command as root. Execution is refused if the nam
 The default mode preserves the host default route but creates veth devices and project-owned NAT/forwarding rules, enabling IPv4 forwarding when needed. Shutdown uses recorded ownership for cleanup; existing external resources with matching names must not be treated as available for takeover.
 
 The namespace egress firewall is installed before connectivity is established. If the tunnel interface or routes disappear, new requests fail instead of leaving directly through the host; the watchdog can subsequently attempt recovery. This protection relies on the kernel firewall rather than the health-check polling interval.
+
+#### AI applications and datacenter egress validation
+
+1. **Verify egress:** run the trace request above and `cfwarp health` to confirm the proxy and WARP tunnel.
+2. **Verify the client:** explicitly configure SOCKS5 in the AI SDK, agent, or backend. Some clients ignore `ALL_PROXY` or need optional SOCKS support; an HTTP-only proxy setting cannot use this SOCKS5 endpoint as an HTTP proxy.
+3. **Verify the workload:** send a minimal real request using your own account, API credentials, and an authorized model, and check the expected result. Read streaming responses to completion. Use the provider’s error details to diagnose 401/403/429 responses, including authentication, permissions, region, egress policy, or quota; a status code alone does not establish WARP availability.
+4. **Compare the outcome:** test direct and proxied requests on the same server, comparing success rate, latency, and streaming completion before choosing workloads for WARP. Do not assume the proxy is faster.
+
+WARP supplies an alternative egress without changing the original IP’s reputation or the provider’s account, region, and usage requirements. Built-in health checks validate SOCKS5/WARP, not continuous access to every AI provider or model; critical workloads still need application-level probes. Keep proxy access within a controlled host/network and credentials in private configuration.
 
 ### 4. DNS and authentication
 
