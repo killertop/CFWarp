@@ -40,6 +40,23 @@ require_root() { :; }
 install_deps() { :; }
 systemd_available() { [ "${SYSTEMD_RELOAD_TEST:-0}" = 1 ]; }
 systemctl() {
+    if [ "${STATEFUL_SYSTEMD_TEST:-0}" = 1 ]; then
+        printf '%s\\n' "$*" >> "$FIXTURE/service-events"
+        case "$1" in
+            show) cat "$FIXTURE/state-${4}"; return ;;
+            stop)
+                printf '%s\\n' "${FAKE_STOP_STATE:-inactive}" > "$FIXTURE/state-${2}"
+                return ;;
+            start|restart)
+                # Restoration must release all gates needed by the old runtime.
+                flock -n "$FIXTURE/old-data/.service-probe.lock" true || return 94
+                flock -n "$FIXTURE/refresh/refresh.lock" true || return 95
+                printf 'active\\n' > "$FIXTURE/state-${2}"; return ;;
+            is-active) [ "$(cat "$FIXTURE/state-${3}")" = active ]; return ;;
+            enable)
+                if [ "${2:-}" = --now ]; then printf 'active\\n' > "$FIXTURE/state-${3}"; fi ;;
+        esac
+    fi
     case "$1" in
         enable)
             if [ "${2:-}" = --now ]; then
@@ -77,6 +94,17 @@ print_summary() { :; }
                 "--env-dir", str(self.base / "env"), "--data-dir", str(self.base / "new-data"),
                 "--systemd-dir", str(self.base / "units"), *extra]
 
+    def stateful_systemd(self):
+        self.env.update(SYSTEMD_RELOAD_TEST='1', STATEFUL_SYSTEMD_TEST='1')
+        for unit in ('cfwarp.service', 'cfwarp-watchdog.timer', 'cfwarp-endpoint-refresh.timer'):
+            (self.base / ('state-' + unit)).write_text('active\n')
+        for unit in ('cfwarp-watchdog.service', 'cfwarp-endpoint-refresh.service'):
+            (self.base / ('state-' + unit)).write_text('inactive\n')
+
+    def assert_original_services_active(self):
+        for unit in ('cfwarp.service', 'cfwarp-watchdog.timer', 'cfwarp-endpoint-refresh.timer'):
+            self.assertEqual((self.base / ('state-' + unit)).read_text(), 'active\n', unit)
+
     def assert_busy_preserves_runtime(self, lock, *action):
         with (self.base / lock).open("a") as held:
             fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -88,6 +116,50 @@ print_summary() { :; }
 
     def test_busy_refresh_blocks_upgrade(self):
         self.assert_busy_preserves_runtime("refresh/refresh.lock")
+
+    def test_busy_refresh_refuses_before_stopping_original_service_or_timers(self):
+        self.stateful_systemd()
+        self.assert_busy_preserves_runtime('refresh/refresh.lock')
+        self.assert_original_services_active()
+        self.assertFalse((self.base / 'service-events').exists())
+
+    def test_busy_destination_restores_original_service_and_timers_before_exit(self):
+        self.stateful_systemd()
+        self.assert_busy_preserves_runtime('new-data/.service-probe.lock')
+        self.assert_original_services_active()
+        events = (self.base / 'service-events').read_text()
+        self.assertIn('stop cfwarp.service\n', events)
+        self.assertIn('start cfwarp.service\n', events)
+        # A later successful retry still sees the original active state.
+        result = subprocess.run(self.command(), env=self.env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_original_services_active()
+
+    def test_pending_recovery_refuses_before_stopping_services(self):
+        self.stateful_systemd()
+        (self.base / 'new-data/.refresh-pending').write_text('recovery required\n')
+        result = subprocess.run(self.command(), env=self.env, capture_output=True, text=True, timeout=15)
+        self.assertNotEqual(result.returncode, 0)
+        self.assert_original_services_active()
+        self.assertFalse((self.base / 'service-events').exists())
+
+    def test_failed_stop_does_not_auto_start_unclean_runtime(self):
+        self.stateful_systemd()
+        result = subprocess.run(self.command(), env=self.env | {'FAKE_STOP_STATE': 'failed'},
+                                capture_output=True, text=True, timeout=15)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.old_runtime.read_text(), 'old runtime\n')
+        self.assertNotIn('start ', (self.base / 'service-events').read_text())
+
+    def test_publication_failure_does_not_auto_start_mixed_runtime(self):
+        self.stateful_systemd()
+        source = self.installer.read_text().replace('touch "$FIXTURE/publishing"',
+                                                   'touch "$FIXTURE/publishing"\n    return 1')
+        self.installer.write_text(source)
+        result = subprocess.run(self.command(), env=self.env, capture_output=True, text=True, timeout=15)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((self.base / 'publishing').exists())
+        self.assertNotIn('start ', (self.base / 'service-events').read_text())
 
     def test_busy_refresh_blocks_forced_cleanup(self):
         self.assert_busy_preserves_runtime("refresh/refresh.lock", "--clean-generated", "--force")

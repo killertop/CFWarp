@@ -29,6 +29,7 @@ class Preflight(unittest.TestCase):
 require_root() { :; }
 install_deps() { :; }
 acquire_install_lock() { :; }
+acquire_install_refresh_locks() { :; }
 acquire_install_runtime_locks() { :; }
 release_install_runtime_locks() { :; }
 build_microsocks() { :; }

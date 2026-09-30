@@ -22,7 +22,7 @@ jobs:
       - name: Install test dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y shellcheck ripgrep python3 wireguard-tools iproute2 iptables util-linux curl
+          sudo apt-get install -y build-essential shellcheck ripgrep python3 wireguard-tools iproute2 iptables util-linux curl
       - name: Syntax, source scan and behavior regressions
         run: make test
       - name: ShellCheck

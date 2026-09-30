@@ -176,6 +176,8 @@ install_deps() {
 CFWARP_BUILD_TMP=
 CFWARP_MICROSOCKS_STAGED=
 CFWARP_WG_QUICK_STAGED=
+CFWARP_UPGRADE_QUIESCED=0
+CFWARP_PUBLICATION_STARTED=0
 cleanup_install_temporary_files() {
     CFWARP_INSTALL_EXIT_STATUS=$?
     trap - EXIT HUP INT TERM
@@ -188,7 +190,11 @@ cleanup_install_temporary_files() {
     if [ -n "$CFWARP_WG_QUICK_STAGED" ]; then
         rm -f "$CFWARP_WG_QUICK_STAGED" || CFWARP_INSTALL_EXIT_STATUS=1
     fi
-    release_install_runtime_locks || CFWARP_INSTALL_EXIT_STATUS=1
+    CFWARP_RELEASE_OK=1
+    release_install_runtime_locks || { CFWARP_INSTALL_EXIT_STATUS=1; CFWARP_RELEASE_OK=0; }
+    if [ "$CFWARP_INSTALL_EXIT_STATUS" -ne 0 ] && [ "$CFWARP_RELEASE_OK" = 1 ]; then
+        restore_quiesced_upgrade || CFWARP_INSTALL_EXIT_STATUS=1
+    fi
     exit "$CFWARP_INSTALL_EXIT_STATUS"
 }
 
@@ -200,18 +206,19 @@ build_microsocks() {
         fi
         return 0
     fi
-    if ! printf '%s\n' "$MICROSOCKS_COMMIT" | awk 'length($0) == 40 && $0 ~ /^[0-9A-Fa-f]+$/ { exit 0 } { exit 1 }'; then
-        echo "==> [ERROR] MICROSOCKS_COMMIT 必须是 40 位十六进制 commit。" >&2
+    if [ "$MICROSOCKS_REPO" != https://github.com/rofl0r/microsocks.git ] ||
+        [ "$MICROSOCKS_COMMIT" != 98421a21c4adc4c77c0cf3a5d650cc28ad3e0107 ]; then
+        echo '==> [ERROR] MicroSOCKS 使用仓库内的固定来源与安全修复；不支持替换 MICROSOCKS_REPO/COMMIT。' >&2
         exit 1
     fi
     CFWARP_BUILD_TMP=$(mktemp -d)
     CFWARP_MICROSOCKS_STAGED="${BIN_DIR}/.microsocks.new.$$"
-    git clone "$MICROSOCKS_REPO" "${CFWARP_BUILD_TMP}/microsocks"
+    mkdir "${CFWARP_BUILD_TMP}/microsocks"
+    for CFWARP_MICROSOCKS_SOURCE in Makefile sockssrv.c server.c server.h sblist.c sblist.h sblist_delete.c; do
+        cp "${SCRIPT_DIR}/vendor/microsocks/${CFWARP_MICROSOCKS_SOURCE}" "${CFWARP_BUILD_TMP}/microsocks/"
+    done
     (
         cd "${CFWARP_BUILD_TMP}/microsocks"
-        git checkout --detach "$MICROSOCKS_COMMIT"
-        ACTUAL_COMMIT=$(git rev-parse HEAD)
-        [ "$ACTUAL_COMMIT" = "$MICROSOCKS_COMMIT" ] || { echo "==> [ERROR] microsocks commit 校验失败。" >&2; exit 1; }
         make CFLAGS="$MICROSOCKS_CFLAGS"
         install -d "$BIN_DIR"
         install -m 0755 microsocks "$CFWARP_MICROSOCKS_STAGED"
@@ -481,6 +488,33 @@ stop_for_upgrade() {
             return 1
         fi
     done
+    CFWARP_UPGRADE_QUIESCED=1
+}
+
+restore_quiesced_upgrade() {
+    # Once publication starts, mixed old/new files are not safe to auto-start.
+    # Likewise, an unsuccessful stop must retain its failed cleanup state.
+    [ "${CFWARP_UPGRADE_QUIESCED:-0}" = 1 ] && [ "${CFWARP_PUBLICATION_STARTED:-0}" = 0 ] || return 0
+    if [ -n "${CFWARP_INSTALL_OLD_DATA:-}" ] &&
+        { [ -e "$CFWARP_INSTALL_OLD_DATA/.refresh-pending" ] || [ -L "$CFWARP_INSTALL_OLD_DATA/.refresh-pending" ]; }; then
+        echo '旧配置仍有刷新恢复标记，未自动恢复服务；请完成恢复后启动。' >&2
+        return 1
+    fi
+    for CFWARP_UNIT in cfwarp.service cfwarp-watchdog.service cfwarp-endpoint-refresh.service; do
+        cleanup_read_unit_state "$CFWARP_UNIT" || return 1
+    done
+    CFWARP_RESTORE_STATUS=0
+    if [ "${SERVICE_WAS_ACTIVE:-0}" = 1 ]; then
+        if ! systemctl start cfwarp.service || ! systemctl is-active --quiet cfwarp.service; then
+            echo '安装在发布前失败，原运行文件未改动，但原服务恢复失败；请检查日志和锁占用后启动。' >&2
+            CFWARP_RESTORE_STATUS=1
+        fi
+    fi
+    for CFWARP_TIMER in ${ACTIVE_TIMERS:-}; do
+        systemctl start "$CFWARP_TIMER" || CFWARP_RESTORE_STATUS=1
+    done
+    [ "$CFWARP_RESTORE_STATUS" = 0 ] || return 1
+    echo '安装在发布前失败，已恢复原服务和定时器的运行状态。' >&2
 }
 
 acquire_install_lock() {
@@ -610,7 +644,7 @@ release_install_runtime_locks() {
     CFWARP_INSTALL_GATES_OPEN=0
 }
 
-acquire_install_runtime_locks() {
+acquire_install_refresh_locks() {
     CFWARP_INSTALL_TARGETS=$(install_runtime_lock_targets) || return 1
     CFWARP_INSTALL_OLD_REFRESH=$(printf '%s\n' "$CFWARP_INSTALL_TARGETS" | sed -n '1p')
     CFWARP_INSTALL_NEW_REFRESH=$(printf '%s\n' "$CFWARP_INSTALL_TARGETS" | sed -n '2p')
@@ -631,6 +665,23 @@ acquire_install_runtime_locks() {
         exec 4>>"$CFWARP_INSTALL_GATE_FILE"
         take_install_runtime_lock 4 || return 1
     fi
+    for CFWARP_INSTALL_DATA_PATH in "$CFWARP_INSTALL_OLD_DATA" "$CFWARP_INSTALL_NEW_DATA"; do
+        if [ -e "$CFWARP_INSTALL_DATA_PATH/.refresh-pending" ] || [ -L "$CFWARP_INSTALL_DATA_PATH/.refresh-pending" ]; then
+            echo 'Pending refresh recovery; refusing installation before stopping services.' >&2
+            return 1
+        fi
+    done
+    umask "$CFWARP_INSTALL_GATE_UMASK"
+}
+
+acquire_install_runtime_locks() {
+    # Normal upgrades already hold refresh gates before stopping any units.
+    # Cleanup also uses this function, after its explicit stop/refusal checks.
+    if [ "${CFWARP_INSTALL_GATES_OPEN:-0}" != 1 ]; then
+        acquire_install_refresh_locks || return 1
+    fi
+    CFWARP_INSTALL_GATE_UMASK=$(umask)
+    umask 077
     prepare_install_runtime_lock "$CFWARP_INSTALL_OLD_DATA" .service-probe.lock || return 1
     cfwarp_lifecycle_lock "$CFWARP_INSTALL_OLD_DATA" || return 1
     CFWARP_INSTALL_GATE_FDS="6 $CFWARP_INSTALL_GATE_FDS"
@@ -702,8 +753,10 @@ trap cleanup_install_temporary_files EXIT
 trap 'exit 143' HUP INT TERM
 build_microsocks
 prepare_private_wg_quick
+acquire_install_refresh_locks
 stop_for_upgrade
 acquire_install_runtime_locks
+CFWARP_PUBLICATION_STARTED=1
 publish_microsocks
 install_private_wg_quick
 install_runtime_files

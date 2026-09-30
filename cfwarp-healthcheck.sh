@@ -114,10 +114,16 @@ proxy_connect_host() {
     case "$CFWARP_MODE" in
         netns-proxy) printf '%s\n' "$NETNS_PEER_HOST" ;;
         host-global)
-            case "$BIND_ADDR" in
-                ''|0.0.0.0|::|\[::\]) printf '%s\n' 127.0.0.1 ;;
-                *) printf '%s\n' "$BIND_ADDR" ;;
-            esac
+            if [ -z "$BIND_ADDR" ]; then
+                printf '%s\n' 127.0.0.1
+            else
+                CFWARP_HEALTH_BIND=$(cfwarp_normalize_bind_addr "$BIND_ADDR") || return 1
+                if cfwarp_is_wildcard_bind "$CFWARP_HEALTH_BIND"; then
+                    printf '%s\n' 127.0.0.1
+                else
+                    printf '%s\n' "$CFWARP_HEALTH_BIND"
+                fi
+            fi
             ;;
     esac
 }
@@ -149,7 +155,7 @@ write_failure_metrics() {
 }
 
 check_once() {
-    PROXY_HOST=$(proxy_connect_host)
+    PROXY_HOST=$(proxy_connect_host) || { echo '==> [ERROR] BIND_ADDR 格式无效。' >&2; return 1; }
     if [ "$CFWARP_MODE" = "netns-proxy" ] && ! ip netns list 2>/dev/null | awk '{print $1}' | grep -Fx "$NETNS_NAME" >/dev/null 2>&1; then
         echo "==> [ERROR] network namespace 不存在: $NETNS_NAME" >&2
         write_failure_metrics netns_missing "$PROXY_HOST"

@@ -76,13 +76,14 @@ git() {
         *) return 1 ;;
     esac
 }
-make() { :; }
+make() { printf '#!/bin/sh\nprintf "new-binary\\n"\n' > microsocks; }
+SCRIPT_DIR=$TEST_SOURCE
 BIN_DIR="$TEST_CASE/bin"
 ENV_FILE="$TEST_CASE/env"
 DATA_DIR="$TEST_CASE/data"
 SKIP_BUILD=0
-MICROSOCKS_REPO=fixture
-MICROSOCKS_COMMIT=1111111111111111111111111111111111111111
+MICROSOCKS_REPO=https://github.com/rofl0r/microsocks.git
+MICROSOCKS_COMMIT=98421a21c4adc4c77c0cf3a5d650cc28ad3e0107
 MICROSOCKS_CFLAGS=-O2
 trap cleanup_install_temporary_files EXIT
 trap 'exit 143' HUP INT TERM
@@ -112,7 +113,7 @@ STUB
     chmod +x "$TEST_CASE/bin/wg-quick"
     : > "$TEST_CASE/events"
 }
-run_upgrade() { TEST_ROOT="$TMP_DIR" sh "$TMP_DIR/upgrade-harness.sh" > "$TEST_CASE/output" 2>&1; }
+run_upgrade() { TEST_ROOT="$TMP_DIR" TEST_SOURCE="$ROOT_DIR" sh "$TMP_DIR/upgrade-harness.sh" > "$TEST_CASE/output" 2>&1; }
 
 # A refresh is activating while its oneshot is running. Its stop can restore
 # the temporarily inactive main service, which must then stop before publish.

@@ -18,7 +18,7 @@ sudo editor /etc/cfwarp/cfwarp.env
 sudo systemctl enable --now cfwarp.service
 ```
 
-新安装默认准备文件并启用服务开机启动；添加 `--start` 可立即启动或重启。升级会恢复安装前正在运行的服务。缺少隧道配置时，优先复用现有 WARP 账户生成 WireGuard 配置；只有账户也不存在时，才调用 `wgcf register --accept-tos` 注册。默认使用固定版本、带 SHA256 校验的 `wgcf`，MicroSOCKS 从固定 commit 构建。
+新安装默认准备文件并启用服务开机启动；添加 `--start` 可立即启动或重启。升级会恢复安装前正在运行的服务。缺少隧道配置时，优先复用现有 WARP 账户生成 WireGuard 配置；只有账户也不存在时，才调用 `wgcf register --accept-tos` 注册。默认使用固定版本、带 SHA256 校验的 `wgcf`，MicroSOCKS 从仓库内的固定来源源码构建，包含分段握手和资源限制修复。
 
 默认路径为运行文件 `/opt/cfwarp`、环境文件 `/etc/cfwarp/cfwarp.env`、账户与隧道配置 `/var/lib/cfwarp`。可以自定义：
 
@@ -112,6 +112,10 @@ SOCKS_PASS='your-password'
 
 用户名和密码必须同时设置或同时留空，并在客户端配置相同凭据。SOCKS5 用户名/密码认证本身不加密客户端到代理的连接；入口应仅对受控网络开放。
 
+`BIND_ADDR` 仅接受完整 IPv4 或有效 IPv6 地址（IPv6 可带方括号），不接受域名、`0`、`0.0.0`、整数或八进制 IPv4 写法。`host-global` 在启动网络前拒绝无认证的通配地址，包括 IPv6 零地址的完整写法及映射的 IPv4 零地址。
+
+随仓库构建的 MicroSOCKS 默认限制同时存在的客户端为 128 个，未认证连接也计入。完整 SOCKS5 握手的接收期限为 10 秒，零散发送字节不会延长期限；超额连接会关闭。目标 DNS/连接阶段仍可能等待，但受同一客户端总数限制。编译期调整方法见 [MicroSOCKS 说明](vendor/microsocks/README.md)。升级这些修复时不要使用 `--skip-build`，该选项会保留原二进制。
+
 ### 5. 可选模式：宿主机全局出口
 
 仅在明确需要改变宿主机 IPv4 路由时配置：
@@ -193,7 +197,7 @@ sudo journalctl -u cfwarp-endpoint-refresh.service -n 100 --no-pager
 
 升级前备份私有配置和账户数据，在新版源码目录运行安装器。安装器在停服前校验 `wg-quick`；服务处于 `failed` 或停止后的清理失败时，保留旧运行文件并拒绝继续。先用旧版本完成资源清理并验证，再处理失败状态并重试；`--force` 不能跳过清理失败。
 
-安装器在替换或清理运行文件前，取得旧、新配置对应的刷新锁和数据目录生命周期锁。终端直接运行的 `cfwarp refresh` 也会阻止文件变更，`--force` 不会绕过互斥或未完成的恢复标记。取锁失败时，前面已停止的服务可能仍保持停止；处理占用后重新运行安装器。
+升级在停服前取得旧、新配置对应的刷新锁并检查恢复标记；存在刷新任务或未完成的恢复时直接拒绝，保留服务运行状态。停服后取得数据目录生命周期锁；如果此阶段失败，旧资源已清理且运行文件尚未发布，安装器释放锁后恢复原服务与定时器。恢复失败会报错，仍需排除占用后启动原服务。`--force` 不会绕过互斥或未完成的恢复标记。
 
 锁保护文件发布阶段，不提供多文件发布回滚，也不能约束管理员并发改配置、systemd drop-in 或替换锁文件。发布完成后会先释放运行锁再恢复服务；如果此时其他进程抢先占锁，启动可能失败，需要消除占用后重试。
 
@@ -238,7 +242,7 @@ sudo editor /etc/cfwarp/cfwarp.env
 sudo systemctl enable --now cfwarp.service
 ```
 
-A new installation prepares files and enables startup at boot; add `--start` to start or restart immediately. An upgrade restores a service that was running before installation. When the tunnel profile is missing, startup reuses an existing WARP account to generate it. It runs `wgcf register --accept-tos` only when no account exists. The default `wgcf` download is version-pinned and SHA256-verified; MicroSOCKS is built from a pinned commit.
+A new installation prepares files and enables startup at boot; add `--start` to start or restart immediately. An upgrade restores a service that was running before installation. When the tunnel profile is missing, startup reuses an existing WARP account to generate it. It runs `wgcf register --accept-tos` only when no account exists. The default `wgcf` download is version-pinned and SHA256-verified; MicroSOCKS is built from bundled, fixed-provenance sources with fragmented-handshake and resource-limit fixes.
 
 Defaults are `/opt/cfwarp` for runtime files, `/etc/cfwarp/cfwarp.env` for private configuration, and `/var/lib/cfwarp` for account and tunnel data. Custom paths:
 
@@ -332,6 +336,10 @@ SOCKS_PASS='your-password'
 
 Set both or leave both empty, and configure matching client credentials. SOCKS5 username/password authentication does not encrypt the client-to-proxy connection. Restrict the listener to a controlled network.
 
+`BIND_ADDR` accepts full IPv4 or valid IPv6 addresses (optionally bracketed IPv6). Hostnames, `0`, `0.0.0`, integer and octal IPv4 aliases are rejected. Before network startup, `host-global` rejects unauthenticated wildcard binds, including expanded IPv6 zero addresses and IPv4-mapped zero addresses.
+
+The bundled MicroSOCKS limits simultaneous clients to 128, including unauthenticated clients. Reception of the entire SOCKS5 handshake has a 10-second deadline; occasional bytes do not extend it. Excess connections are closed. Target DNS/connect operations may still wait but remain bounded by the same client cap. See [MicroSOCKS notes](vendor/microsocks/README.md) for compile-time adjustments. Do not use `--skip-build` when upgrading these fixes: it retains the previous binary.
+
 ### 5. Optional host-wide egress
 
 Only when host IPv4 routing changes are intended, set:
@@ -413,7 +421,7 @@ sudo journalctl -u cfwarp-endpoint-refresh.service -n 100 --no-pager
 
 Back up private configuration and account data, then run the installer from the new source checkout. The installer validates `wg-quick` before stopping services. A failed unit or unsuccessful stop cleanup blocks further changes and preserves the old runtime. Complete and verify resource cleanup with the old version before clearing the failure state and retrying; `--force` does not bypass cleanup failure.
 
-Before replacing or cleaning runtime files, the installer acquires refresh and lifecycle locks for the old and new configuration paths. Direct CLI `cfwarp refresh` also blocks changes; `--force` cannot bypass contention or pending recovery. Lock refusal can leave previously stopped services stopped; resolve contention and rerun the installer.
+Upgrades acquire refresh locks for the old and new configurations and check recovery markers before stopping services. A running refresh or pending recovery refuses the upgrade while preserving service state. Lifecycle gates are acquired after shutdown. If this phase fails after clean shutdown but before any runtime publication, the installer releases its gates and restores the original service and timers. Restoration failure is reported; resolve contention and start the original service. `--force` cannot bypass contention or pending recovery.
 
 The gates protect publication, without multi-file rollback or protection against concurrent administrator changes to configuration, systemd drop-ins, or lock files. Runtime gates are released before service restoration. Another process winning a gate at that point can prevent startup; resolve contention before retrying.
 

@@ -40,6 +40,47 @@ class Regression(unittest.TestCase):
         self.assertEqual(self.shell('cfwarp_validate_uint 9223372036854775807 inode 1 9223372036854775807').returncode, 0)
         self.assertNotEqual(self.shell('cfwarp_validate_uint 9223372036854775808 inode 1 9223372036854775807').returncode, 0)
 
+    def test_bind_addresses_reject_libc_aliases_and_recognize_all_wildcards(self):
+        for address in ('0', '0.0.0', '00.0.0.0', '0x0', '2130706433', 'localhost', ':::', '[::]extra'):
+            with self.subTest(address=address):
+                self.assertNotEqual(self.shell('cfwarp_normalize_bind_addr "$1"', address).returncode, 0)
+        for address in ('0.0.0.0', '::', '[::]', '0:0:0:0:0:0:0:0', '0000::0',
+                        '::0.0.0.0', '::ffff:0.0.0.0', '::ffff:0:0', '0:0:0:0:0:ffff:0:0'):
+            with self.subTest(address=address):
+                result = self.shell('cfwarp_is_wildcard_bind "$1"', address)
+                self.assertEqual(result.returncode, 0, result.stderr)
+        for address in ('127.0.0.1', '169.254.240.2', '::1', '[2001:db8::1]', 'ffff::', '::ffff:127.0.0.1'):
+            with self.subTest(address=address):
+                self.assertEqual(self.shell('cfwarp_normalize_bind_addr "$1"', address).returncode, 0)
+                self.assertNotEqual(self.shell('cfwarp_is_wildcard_bind "$1"', address).returncode, 0)
+
+    def test_host_wildcard_rejection_precedes_network_and_profile_changes(self):
+        bins = self.base / 'bin'
+        bins.mkdir()
+        for name in ('ip', 'wg'):
+            tool = bins / name
+            tool.write_text('#!/bin/sh\ntouch "$NETWORK_TOUCHED"\nexit 1\n')
+            tool.chmod(0o755)
+        data = self.base / 'data'
+        env = self.env | {'CFWARP_ENV_LOADED': '1', 'CFWARP_MODE': 'host-global',
+                          'CFWARP_DATA_DIR': str(data), 'WG_QUICK_BIN': str(self.base / 'missing-wg-quick'),
+                          'NETWORK_TOUCHED': str(self.base / 'network-touched'),
+                          'PATH': str(bins) + os.pathsep + self.env['PATH']}
+        for address in ('0', '0.0.0', '0.0.0.0', '0:0:0:0:0:0:0:0', '::ffff:0.0.0.0'):
+            with self.subTest(address=address):
+                result = subprocess.run(['sh', str(ROOT / 'entrypoint.sh')],
+                                        env=env | {'BIND_ADDR': address}, capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('BIND_ADDR' if address in ('0', '0.0.0') else '禁止无认证', result.stderr)
+                self.assertFalse(data.exists())
+                self.assertFalse((self.base / 'network-touched').exists())
+        # Authenticated canonical wildcard configuration passes the bind guard.
+        result = subprocess.run(['sh', str(ROOT / 'entrypoint.sh')],
+                                env=env | {'BIND_ADDR': '0:0:0:0:0:0:0:0', 'SOCKS_USER': 'test', 'SOCKS_PASS': 'dummy'},
+                                capture_output=True, text=True, timeout=10)
+        self.assertIn('找不到可执行的 wg-quick', result.stderr)
+        self.assertNotIn('禁止无认证', result.stderr)
+
     def test_env_literal_roundtrip(self):
         config = self.base / "config.env"
         config.write_text("# retained\nVALUE=old\nVALUE=duplicate\n")

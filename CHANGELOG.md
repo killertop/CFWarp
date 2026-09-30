@@ -1,5 +1,16 @@
 # 更新记录 / Changelog
 
+## 2026-09-30
+
+- 在网络启动前验证监听地址，拒绝缩写 IPv4，并覆盖全部 IPv6 通配地址的无认证检查。
+- 升级先取得刷新锁；停服后、文件发布前失败时，在确认旧资源已清理后恢复原服务和定时器。
+- 纳入固定来源的 MicroSOCKS 源码，正确读取分段或合并的 SOCKS5 消息，增加完整握手期限和客户端总数限制。
+- 增加真实本机 TCP、安装恢复和监听地址回归检查。
+- Validate listener addresses before networking, reject IPv4 aliases, and cover all IPv6 wildcard spellings in authentication checks.
+- Take refresh gates before upgrade shutdown; restore original services/timers on pre-publication failure only after clean shutdown.
+- Bundle fixed-provenance MicroSOCKS with complete TCP framing, a whole-handshake deadline, and a total client cap.
+- Add real loopback TCP, installer recovery, and listener-address regressions.
+
 ## 2026-09-28
 
 ### 项目介绍与应用场景 / Positioning and use cases

@@ -87,6 +87,29 @@ case "$CFWARP_ALLOW_INSECURE_WGCF_DOWNLOAD" in
     *) echo "==> [ERROR] CFWARP_ALLOW_INSECURE_WGCF_DOWNLOAD 仅支持 0 或 1。" >&2; exit 1 ;;
 esac
 
+LISTEN_ADDR=${BIND_ADDR:-${PROXY_CONNECT_HOST:-127.0.0.1}}
+LISTEN_PORT=${BIND_PORT:-1080}
+MICROSOCKS_QUIET=${MICROSOCKS_QUIET:-1}
+if [ "$CFWARP_PROBE_MODE" != 1 ]; then
+    LISTEN_ADDR=$(cfwarp_normalize_bind_addr "$LISTEN_ADDR") || {
+        echo '==> [ERROR] BIND_ADDR 必须是完整 IPv4 或有效 IPv6 地址，不支持域名及缩写 IPv4。' >&2
+        exit 1
+    }
+    cfwarp_validate_port "$LISTEN_PORT" BIND_PORT || exit 1
+    case "$MICROSOCKS_QUIET" in
+        0|1) ;;
+        *) echo '==> [ERROR] MICROSOCKS_QUIET 仅支持 0 或 1。' >&2; exit 1 ;;
+    esac
+    if { [ -n "$SOCKS_USER" ] && [ -z "$SOCKS_PASS" ]; } || { [ -z "$SOCKS_USER" ] && [ -n "$SOCKS_PASS" ]; }; then
+        echo '==> [ERROR] SOCKS_USER 和 SOCKS_PASS 必须同时设置，或同时留空。' >&2
+        exit 1
+    fi
+    if [ "${CFWARP_MODE:-netns-proxy}" = host-global ] && cfwarp_is_wildcard_bind "$LISTEN_ADDR" && [ -z "$SOCKS_USER" ]; then
+        echo '==> [ERROR] host-global 模式禁止无认证监听通配地址，请设置 SOCKS_USER/SOCKS_PASS 或绑定 127.0.0.1。' >&2
+        exit 1
+    fi
+fi
+
 if [ ! -x "$WG_QUICK_BIN" ]; then
     WG_QUICK_BIN=$(command -v "$WG_QUICK_BIN" 2>/dev/null || true)
 fi
@@ -595,26 +618,7 @@ fi
 
 write_endpoint_to_config "$SELECTED_ENDPOINT" || { echo "==> [ERROR] 无法保存已验证的 Endpoint。" >&2; exit 1; }
 
-LISTEN_ADDR=${BIND_ADDR:-${PROXY_CONNECT_HOST:-127.0.0.1}}
-LISTEN_PORT=${BIND_PORT:-1080}
 MICROSOCKS_BIN=${MICROSOCKS_BIN:-${SCRIPT_DIR}/bin/microsocks}
-MICROSOCKS_QUIET=${MICROSOCKS_QUIET:-1}
-cfwarp_validate_port "$LISTEN_PORT" BIND_PORT || exit 1
-case "$LISTEN_ADDR" in
-    ''|*[[:space:]]*|*[![:print:]]*) echo "==> [ERROR] BIND_ADDR 含有非法字符。" >&2; exit 1 ;;
-esac
-case "$MICROSOCKS_QUIET" in
-    0|1) ;;
-    *) echo "==> [ERROR] MICROSOCKS_QUIET 仅支持 0 或 1。" >&2; exit 1 ;;
-esac
-if { [ -n "$SOCKS_USER" ] && [ -z "$SOCKS_PASS" ]; } || { [ -z "$SOCKS_USER" ] && [ -n "$SOCKS_PASS" ]; }; then
-    echo "==> [ERROR] SOCKS_USER 和 SOCKS_PASS 必须同时设置，或同时留空。" >&2
-    exit 1
-fi
-if [ "${CFWARP_MODE:-netns-proxy}" = "host-global" ] && cfwarp_is_wildcard_bind "$LISTEN_ADDR" && [ -z "$SOCKS_USER" ]; then
-    echo "==> [ERROR] host-global 模式禁止无认证监听通配地址，请设置 SOCKS_USER/SOCKS_PASS 或绑定 127.0.0.1。" >&2
-    exit 1
-fi
 if [ ! -x "$MICROSOCKS_BIN" ]; then
     MICROSOCKS_BIN=$(command -v microsocks 2>/dev/null || true)
 fi

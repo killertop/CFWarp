@@ -4,7 +4,7 @@
 
 修改应聚焦 [项目范围](PROJECT.md)，并同时更新中英文用户说明。不要提交运行中的 WARP 状态、私钥、账户、访问令牌、私有环境文件、完整生产日志或编译产物。
 
-开发检查需要 Python 3、`ripgrep` 和 ShellCheck；网络集成测试还需要项目的 Linux 网络依赖。提交前先运行：
+开发检查需要 C 编译器、Make、Python 3、`ripgrep` 和 ShellCheck；网络集成测试还需要项目的 Linux 网络依赖。`make test` 会在临时目录构建仓库内的 MicroSOCKS，并使用真实本机 TCP 连接验证分段握手、认证、数据转发、超时和连接上限。提交前先运行：
 
 ```bash
 make test
@@ -27,7 +27,7 @@ PR 请说明触发条件、修改后的行为、验证命令与结果，以及�
 
 Keep changes focused on the [project scope](PROJECT.md), and update both Chinese and English user documentation. Do not commit runtime WARP state, private keys, accounts, access tokens, private environment files, complete production logs, or compiled artifacts.
 
-Development checks require Python 3, `ripgrep`, and ShellCheck; network integration also needs the project's Linux networking dependencies. Before submitting, run:
+Development checks require a C compiler, Make, Python 3, `ripgrep`, and ShellCheck; network integration also needs the project's Linux networking dependencies. `make test` builds the bundled MicroSOCKS in a temporary directory and uses real loopback TCP connections to verify fragmented handshakes, authentication, forwarding, timeouts, and client limits. Before submitting, run:
 
 ```bash
 make test

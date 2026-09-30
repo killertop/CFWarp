@@ -304,11 +304,49 @@ cfwarp_format_socks_proxy_url() {
     esac
 }
 
-cfwarp_is_wildcard_bind() {
-    case "${1:-}" in
-        ''|0.0.0.0|::|\[::\]) return 0 ;;
-        *) return 1 ;;
+cfwarp_normalize_bind_addr() (
+    CFWARP_BIND_ADDRESS=$1
+    case "$CFWARP_BIND_ADDRESS" in
+        \[*\]) CFWARP_BIND_ADDRESS=${CFWARP_BIND_ADDRESS#\[}; CFWARP_BIND_ADDRESS=${CFWARP_BIND_ADDRESS%\]} ;;
     esac
+    case "$CFWARP_BIND_ADDRESS" in
+        *:*) cfwarp_validate_ipv6 "$CFWARP_BIND_ADDRESS" || return 1 ;;
+        *)
+            # Reject libc's shortened, integer, hex and octal IPv4 aliases.
+            # These can resolve to a wildcard despite looking unlike 0.0.0.0.
+            printf '%s\n' "$CFWARP_BIND_ADDRESS" | awk -F. '
+                NF != 4 {exit 1}
+                {for(i=1;i<=4;i++) if($i !~ /^[0-9]+$/ || $i>255 || (length($i)>1 && $i ~ /^0/)) exit 1}
+            ' || return 1 ;;
+    esac
+    printf '%s\n' "$CFWARP_BIND_ADDRESS"
+)
+
+cfwarp_is_wildcard_bind() {
+    case "${1:-}" in '') return 0 ;; esac
+    CFWARP_BIND_NORMALIZED=$(cfwarp_normalize_bind_addr "$1") || return 1
+    # Match every spelling of the IPv6 unspecified address, including IPv4
+    # embedded zeros and the IPv4-mapped unspecified address.
+    printf '%s\n' "$CFWARP_BIND_NORMALIZED" | awk '
+        $0 == "0.0.0.0" {found=1}
+        index($0,":") {
+            value=tolower($0)
+            if (value !~ /[^0:.]/) found=1
+            if (index(value,".")) {
+                tail=value; sub(/^.*:/,"",tail)
+                if (tail != "0.0.0.0") next
+                value=substr(value,1,length(value)-length(tail)) "0:0"
+            }
+            count=split(value,halves,"::")
+            left=split(halves[1],a,":"); if(halves[1]=="") left=0
+            right=0; if(count==2 && halves[2]!="") right=split(halves[2],b,":")
+            expanded=""
+            for(i=1;i<=left;i++) {sub(/^0+/,"",a[i]); expanded=expanded (a[i]=="" ? "0" : a[i]) ":"}
+            if(count==2) for(i=0;i<8-left-right;i++) expanded=expanded "0:"
+            for(i=1;i<=right;i++) {sub(/^0+/,"",b[i]); expanded=expanded (b[i]=="" ? "0" : b[i]) ":"}
+            if(expanded=="0:0:0:0:0:ffff:0:0:") found=1
+        }
+        END {exit !found}'
 }
 
 cfwarp_set_env_key() {

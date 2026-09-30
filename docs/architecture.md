@@ -1,6 +1,6 @@
 # 架构决定与验证范围 / Architecture decisions and validation scope
 
-更新 / Updated: 2026-09-28
+更新 / Updated: 2026-09-30
 
 ## 中文
 
@@ -59,7 +59,9 @@ systemd unit 只传入 `CFWARP_ENV_FILE` 的路径，由所有入口共用的数
 
 转发引用的跨文件更新使用全局锁内的 `ip_forward.pending` 日志，记录目标引用总数、原内核值、实例状态路径和 namespace 身份。所有引用操作先完成未提交事务，以绝对目标值重放，避免状态写入失败后的重试再次增减引用。普通状态写入也在同一锁内同步已提交的引用标记；日志只修改该标记，保留最新 DNS 和规则归属字段。日志提交失败会保留现场并阻止后续引用操作越过它。这针对可重试的写入/系统调用失败，不承诺断电后的持久事务恢复。
 
-升级先停止定时器，再停止并等待包括 `activating` oneshot 在内的辅助服务，随后重新读取并停止主服务，避免取消刷新时恢复的主服务被遗漏。MicroSOCKS 提前编译到暂存文件，停服完成后才发布。安装锁位于专属的 0700 目录，保留系统 `/run/lock` 权限；不再按接口名称补偿清理 host-global 资源。
+升级先取得旧、新配置的刷新锁并检查恢复标记；刷新忙时在停服前拒绝。随后停止定时器和包括 `activating` oneshot 在内的辅助服务，重新读取并停止主服务，再取得生命周期锁。此阶段失败时，只有旧资源清理已确认完成、文件发布尚未开始，才在释放锁后恢复原服务和定时器；清理失败或部分文件发布不会自动重启。MicroSOCKS 从仓库内固定来源的源码提前编译到暂存文件，停服完成后才发布。安装锁位于专属的 0700 目录，保留系统 `/run/lock` 权限；不再按接口名称补偿清理 host-global 资源。
+
+MicroSOCKS 按协议长度累计接收 TCP 数据，保留合并到同一次发送中的后续应用字节。完整握手接收共用单调时钟期限（默认 10 秒），同时限制客户端总数（默认 128，含未认证连接）。目标 DNS/连接阻塞仍由总数限制约束。监听地址必须为有效数值 IP；`host-global` 在网络操作前拒绝全部通配地址的无认证监听。
 
 ### 修复验证说明
 
@@ -134,7 +136,9 @@ Keep the previous version and private configuration backups before upgrading. Th
 
 Cross-file forwarding updates use an `ip_forward.pending` journal under the global lock, recording absolute target references, the original kernel setting, the instance state path, and namespace identity. Every reference operation first completes pending work by replaying target values, preventing retries after failed state writes from incrementing or decrementing twice. Ordinary state writes synchronize the committed membership flag under the same lock; journal replay changes only that flag, preserving newer DNS/rule ownership fields. Failed commits retain the journal and block later reference operations from bypassing it. This handles retryable write/system-call failures and does not promise durable recovery after power loss.
 
-Upgrades stop timers, then stop and wait for helper services including `activating` oneshots, then reread and stop the main service so refresh cancellation cannot restore it unnoticed. MicroSOCKS is built into a staged file and published only after shutdown. The installation lock uses a dedicated 0700 directory without changing system `/run/lock` permissions; host-global resources are no longer cleaned through interface-name compensation.
+Upgrades first take old/new refresh gates and check recovery markers, refusing a busy refresh before shutdown. They then stop timers and helper services including `activating` oneshots, reread and stop main, and acquire lifecycle gates. Failure at this phase restores original services/timers after releasing gates only when old cleanup completed and publication has not started. Failed cleanup or partial publication never triggers an automatic restart. MicroSOCKS is built from bundled fixed-provenance sources into a staged file and published only after shutdown. The installation lock uses a dedicated 0700 directory without changing system `/run/lock` permissions; host-global resources are no longer cleaned through interface-name compensation.
+
+MicroSOCKS accumulates TCP bytes according to protocol frame lengths, leaving pipelined application data unread until forwarding. One monotonic deadline covers reception of the whole handshake (10 seconds by default), with a total client cap (128 by default, including unauthenticated clients). Target DNS/connect blocking remains bounded by the cap. Listener addresses must be numeric IPs; `host-global` rejects every unauthenticated wildcard spelling before network operations.
 
 ### Validation scope
 

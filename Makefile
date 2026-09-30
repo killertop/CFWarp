@@ -5,6 +5,7 @@ check:
 
 test: check
 	@python3 tests/regression.py
+	@python3 tests/microsocks-regression.py
 	@sh tests/runtime-regression.sh
 	@sh tests/network-lock-regression.sh
 	@sh tests/network-refcount-regression.sh
